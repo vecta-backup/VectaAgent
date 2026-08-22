@@ -20,15 +20,15 @@ jobs:
           apt-get install -y software-properties-common
           add-apt-repository -y ppa:deadsnakes/ppa
           apt-get update
-          apt-get install -y python3.11 python3.11-venv python3.11-dev binutils curl
-          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
+          apt-get install -y python3.10 python3.10-venv python3.10-dev binutils curl
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Python dependencies
-        run: python3.11 -m pip install pyinstaller -r requirements.txt
+        run: python3.10 -m pip install pyinstaller -r requirements.txt
 
       - name: Build binary
-        run: python3.11 -m PyInstaller vecta-agent.spec
+        run: python3.10 -m PyInstaller vecta-agent.spec
 
       - name: Generate checksums
         run: |
