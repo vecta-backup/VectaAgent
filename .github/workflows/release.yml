@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: debian:12-slim
+    container: ubuntu:22.04
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +21,7 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Python dependencies
-        run: pip install --break-system-packages pyinstaller -r requirements.txt
+        run: pip install pyinstaller -r requirements.txt
 
       - name: Build binary
         run: pyinstaller vecta-agent.spec
