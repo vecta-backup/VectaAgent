@@ -1,0 +1,14 @@
+.build-venv/
+build/
+dist/
+*.egg-info/
+__pycache__/
+.git/
+.gitignore
+.github/
+.idea/
+.pytest_cache/
+.tox/
+.venv/
+env/
+venv/

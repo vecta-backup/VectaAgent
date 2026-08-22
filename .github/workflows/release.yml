@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:12-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3 python3-pip python3-venv binutils
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Install Python dependencies
+        run: pip install --break-system-packages pyinstaller -r requirements.txt
+
+      - name: Build binary
+        run: pyinstaller vecta-agent.spec
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vecta-agent
+          generate_release_notes: true

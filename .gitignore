@@ -1,0 +1,39 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# PyInstaller
+*.manifest
+*.spec
+!vecta-agent.spec
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+
+# Build artifacts
+.build-venv/
+
+# Local / agent docs (not for public repo)
+AGENTS.md
+AGENT_SPEC.md
+FRONTEND_SETUP_REFERENCE.md
+
+# OS
+Thumbs.db
+Desktop.ini
