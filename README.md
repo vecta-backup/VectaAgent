@@ -44,7 +44,7 @@ sudo chmod +x /usr/local/bin/vecta-agent
 
 ### From source
 
-Requires Python 3.10+:
+Requires Python 3.12+:
 
 ```bash
 git clone https://github.com/vecta-backup/VectaAgent.git
@@ -126,7 +126,7 @@ Produces `dist/vecta-agent`.
 
 ## Requirements
 
-- Python 3.10+ (for building/development)
+- Python 3.12+ (for building/development)
 - Linux (for running the agent)
 - [restic](https://restic.net) on `PATH`
 - `flock` (part of `util-linux` on most distros)

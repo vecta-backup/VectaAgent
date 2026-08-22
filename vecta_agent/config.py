@@ -8,7 +8,7 @@ from pathlib import Path
 
 try:
     import tomllib
-except ImportError:  # pragma: no cover
+except ImportError:
     import tomli as tomllib
 
 
