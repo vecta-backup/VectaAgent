@@ -1,17 +1,24 @@
-FROM debian:12-slim
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
-    python3 \
-    python3-venv \
-    python3-pip \
+    software-properties-common \
+    curl \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
     binutils \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
 # Install deps once; source is mounted at runtime
 COPY requirements.txt .
-RUN pip install --break-system-packages -r requirements.txt pyinstaller
+RUN python3.11 -m pip install -r requirements.txt pyinstaller
 
 # Default: drop into a shell (run ./build.sh manually, or override CMD)
 CMD ["bash"]

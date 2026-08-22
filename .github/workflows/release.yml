@@ -10,21 +10,25 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    container: ubuntu:20.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
           apt-get update
-          apt-get install -y python3 python3-pip python3-venv binutils
+          apt-get install -y software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update
+          apt-get install -y python3.11 python3.11-venv python3.11-dev binutils curl
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11
           rm -rf /var/lib/apt/lists/*
 
       - name: Install Python dependencies
-        run: pip install pyinstaller -r requirements.txt
+        run: python3.11 -m pip install pyinstaller -r requirements.txt
 
       - name: Build binary
-        run: pyinstaller vecta-agent.spec
+        run: python3.11 -m PyInstaller vecta-agent.spec
 
       - name: Generate checksums
         run: |
