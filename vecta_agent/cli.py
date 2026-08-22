@@ -84,6 +84,10 @@ def run_repo_init(args: argparse.Namespace) -> None:
             raise SystemExit(1)
         print(f"Repository initialized at {destination}.")
         print(
+            f"Password saved to {config_dir / 'restic.env'} (this one password is used "
+            "for every repository on this machine; new destinations are auto-initialized)."
+        )
+        print(
             "WARNING: This password is stored only on this machine and cannot be recovered. "
             "Store it in a password manager now - losing it permanently locks your backups."
         )
