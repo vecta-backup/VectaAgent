@@ -1,24 +1,12 @@
-FROM ubuntu:20.04
+FROM python:3.10-slim-bullseye
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update && apt-get install -y \
-    software-properties-common \
-    curl \
-    && add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y \
-    python3.10 \
-    python3.10-venv \
-    python3.10-dev \
-    binutils \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10 \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y binutils && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
 # Install deps once; source is mounted at runtime
 COPY requirements.txt .
-RUN python3.10 -m pip install -r requirements.txt pyinstaller
+RUN pip install -r requirements.txt pyinstaller
 
 # Default: drop into a shell (run ./build.sh manually, or override CMD)
 CMD ["bash"]
