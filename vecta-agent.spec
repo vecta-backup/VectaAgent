@@ -16,6 +16,7 @@ a = Analysis(
         'h11',
         'anyio._backends._trio',
         'anyio._backends._asyncio',
+        'tomli',
     ],
     hookspath=[],
     hooksconfig={},
