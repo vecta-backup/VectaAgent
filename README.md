@@ -25,6 +25,14 @@ vecta-agent run
 
 ## Installation
 
+### From Vecta dashboard
+
+When registering a new agent on the Vecta dashboard, you will get a one-liner install script that downloads everything (binary, restic) automatically
+
+```bash
+curl -fsSL https://vectaapp.com/install.sh | sudo bash -s -- --token <REGISTRATION_TOKEN>
+```
+
 ### From binary
 
 Download the prebuilt binary from releases and place it on `PATH`:
@@ -88,12 +96,12 @@ AWS_SECRET_ACCESS_KEY=...
 The agent is designed to run from cron:
 
 ```cron
-*/5 * * * * flock -n /var/lock/vecta-agent.lock /usr/local/bin/vecta-agent run >> /var/log/vecta-agent.log 2>&1
+*/2 * * * * flock -n /var/lock/vecta-agent.lock /usr/local/bin/vecta-agent run >> /var/log/vecta-agent.log 2>&1
 ```
 
 - The backend decides when jobs are due via `schedule_interval_minutes`
 - `flock -n` prevents overlapping runs; a slow run never overlaps a new one
-- Every 5 minutes is a good balance between responsiveness and overhead
+- Every 2 minutes is a good balance between responsiveness and overhead
 
 ## Development
 
@@ -125,4 +133,4 @@ Produces `dist/vecta-agent`.
 
 ## License
 
-MIT
+Apache 2.0
