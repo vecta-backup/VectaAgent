@@ -15,6 +15,11 @@ logger = logging.getLogger("vecta_agent")
 
 
 def _setup_logging() -> None:
+    # httpx logs a noisy "HTTP Request: ..." INFO line per call. The backend
+    # URLs are not user-meaningful, so quiet those loggers; vecta_agent's own
+    # INFO messages are the meaningful progress the user should see.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
