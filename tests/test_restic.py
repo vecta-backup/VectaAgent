@@ -7,6 +7,58 @@ class FakeResult:
         self.stderr_tail = stderr_tail
 
 
+class TestRepoOptions:
+    def test_sftp_with_port(self):
+        assert restic.repo_options("sftp:user@host:/path", 2222) == [
+            "-o", "sftp.args=-p 2222",
+        ]
+
+    def test_sftp_without_port(self):
+        assert restic.repo_options("sftp:user@host:/path", None) == []
+
+    def test_non_sftp_port_ignored(self):
+        assert restic.repo_options("/mnt/backups", 2222) == []
+        assert restic.repo_options("s3:s3.amazonaws.com/bucket", 2222) == []
+
+    def test_backup_cmd_includes_sftp_args(self):
+        runner = restic.ResticRunner("/src", "sftp:user@host:/path", port=2222)
+        assert runner._build_cmd() == [
+            "restic",
+            "backup",
+            "--json",
+            "-o", "sftp.args=-p 2222",
+            "--repo",
+            "sftp:user@host:/path",
+            "/src",
+        ]
+
+    def test_check_repo_uses_port(self, monkeypatch):
+        calls = []
+
+        def fake_run_restic(args, env=None):
+            calls.append(args)
+            return FakeResult(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run_restic)
+        restic.check_repo("sftp:user@host:/path", port=2222)
+        assert calls[0] == [
+            "-o", "sftp.args=-p 2222", "cat", "config", "--repo", "sftp:user@host:/path",
+        ]
+
+    def test_init_repo_uses_port(self, monkeypatch):
+        calls = []
+
+        def fake_run_restic(args, env=None):
+            calls.append(args)
+            return FakeResult(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run_restic)
+        restic.init_repo("sftp:user@host:/path", port=2222)
+        assert calls[0] == [
+            "-o", "sftp.args=-p 2222", "init", "--repo", "sftp:user@host:/path",
+        ]
+
+
 class TestRunRestic:
     def test_command_and_env(self, monkeypatch):
         captured = {}

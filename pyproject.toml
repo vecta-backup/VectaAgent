@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vecta-agent"
-version = "0.2.3"
+version = "0.3.0"
 description = "Stateless backup agent for the Vecta platform"
 requires-python = ">=3.12"
 dependencies = [

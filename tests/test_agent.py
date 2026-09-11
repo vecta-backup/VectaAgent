@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from vecta_agent import agent, api, config, restic
+from vecta_agent import agent, api, config, restic, secrets
 
 
 class FakeApiClient:
@@ -38,9 +38,10 @@ class FakeApiClient:
 
 
 class FakeRunner:
-    def __init__(self, source, destination, env=None):
+    def __init__(self, source, destination, port=None, env=None):
         self.source = source
         self.destination = destination
+        self.port = port
         self.env = env or {}
         self.terminated = False
         self.exit_code = 0
@@ -108,8 +109,8 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, env=None):
-            r = FakeRunner(source, destination, env)
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
             r.summary = {
                 "message_type": "summary",
                 "snapshot_id": "snap1",
@@ -140,8 +141,8 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j2", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, env=None):
-            r = FakeRunner(source, destination, env)
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
             r.exit_code = 1
             r.stderr = "restic failed"
             return r
@@ -169,8 +170,8 @@ class TestRunAgent:
             {"cancel_requested": True},
         ]
 
-        def fake_runner(source, destination, env=None):
-            r = FakeRunner(source, destination, env)
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
             r.status_count = 100  # long-running
             r.exit_code = 130
             return r
@@ -214,9 +215,9 @@ class TestRunAgent:
 
         captured_env = {}
 
-        def fake_runner(source, destination, env=None):
+        def fake_runner(source, destination, port=None, env=None):
             captured_env.update(env or {})
-            r = FakeRunner(source, destination, env)
+            r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
             return r
 
@@ -257,8 +258,8 @@ class TestRunAgent:
         fake.jobs = [{"job_id": "j6", "source": "/src", "destination": "/dest"}]
         init_calls = patch_repo(monkeypatch, exists=False)
 
-        def fake_runner(source, destination, env=None):
-            r = FakeRunner(source, destination, env)
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "snap1"}
             return r
 
@@ -334,7 +335,7 @@ class TestRunAgent:
             lambda *a, **kw: init_calls.append(a) or restic.ResticResult(exit_code=0),
         )
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
-        monkeypatch.setattr(agent.restic, "ResticRunner", lambda source, destination, env=None: FakeRunner(source, destination, env))
+        monkeypatch.setattr(agent.restic, "ResticRunner", lambda source, destination, port=None, env=None: FakeRunner(source, destination, port, env))
 
         agent.run_agent()
 
@@ -347,7 +348,7 @@ class TestRunAgent:
         fake.jobs = [{"job_id": "j4", "source": "/src", "destination": "/dest"}]
 
         class MissingRunner:
-            def __init__(self, source, destination, env=None):
+            def __init__(self, source, destination, port=None, env=None):
                 pass
 
             def start(self):
@@ -415,6 +416,151 @@ class TestRunAgent:
         assert failure["status"] == "failed"
         assert failure["exit_code"] == 127
         assert "restic binary not found in PATH" in failure["message"]
+
+
+class TestCredentialProfiles:
+    def test_profile_env_merged_and_overrides_global(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)  # restic.env: RESTIC_PASSWORD=test
+        secrets.save_profile("prod-s3", {
+            "RESTIC_PASSWORD": "profile-secret",
+            "AWS_ACCESS_KEY_ID": "AKIA",
+        })
+
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{
+            "job_id": "j1",
+            "source": "/src",
+            "destination": "/dest",
+            "credential_profile": "prod-s3",
+        }]
+
+        captured_env = {}
+
+        def fake_runner(source, destination, port=None, env=None):
+            captured_env.update(env or {})
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {"message_type": "summary", "snapshot_id": "s1"}
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert captured_env["RESTIC_PASSWORD"] == "profile-secret"
+        assert captured_env["AWS_ACCESS_KEY_ID"] == "AKIA"
+        assert fake.status_reports[-1]["status"] == "success"
+
+    def test_missing_profile_reports_failed(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{
+            "job_id": "j1",
+            "source": "/src",
+            "destination": "/dest",
+            "credential_profile": "prod-s3",
+        }]
+        runner_called = []
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(
+            agent.restic, "ResticRunner",
+            lambda *a, **kw: runner_called.append(a),
+        )
+
+        agent.run_agent()
+
+        assert runner_called == []
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 1
+        assert "prod-s3" in failure["message"]
+        assert "vecta-agent secret set prod-s3" in failure["message"]
+
+    def test_missing_profile_password_hint(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        (tmp_config_dir / "restic.env").write_text("AWS_ACCESS_KEY_ID=AKIA\n")
+        secrets.save_profile("prod-s3", {"AWS_ACCESS_KEY_ID": "AKIA"})
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{
+            "job_id": "j1",
+            "source": "/src",
+            "destination": "/dest",
+            "credential_profile": "prod-s3",
+        }]
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(
+            agent.restic, "ResticRunner",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")),
+        )
+
+        agent.run_agent()
+
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert "secret set prod-s3" in failure["message"]
+
+    def test_invalid_profile_reports_failed(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        path = secrets.secrets_path()
+        path.write_text("[prod-s3]\nCOUNT = 3\n", encoding="utf-8")
+
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{
+            "job_id": "j1",
+            "source": "/src",
+            "destination": "/dest",
+            "credential_profile": "prod-s3",
+        }]
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+
+        agent.run_agent()
+
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert "Invalid credential profile" in failure["message"]
+
+    def test_profile_used_for_repo_probe_and_init(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        secrets.save_profile("prod-s3", {"RESTIC_PASSWORD": "profile-secret"})
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{
+            "job_id": "j1",
+            "source": "/src",
+            "destination": "/dest",
+            "credential_profile": "prod-s3",
+        }]
+
+        probe_env = {}
+        init_env = {}
+
+        def fake_check(destination, env=None, port=None):
+            probe_env.update(env or {})
+            return restic.RepoCheck(False)
+
+        def fake_init(destination, env=None, port=None):
+            init_env.update(env or {})
+            return restic.ResticResult(exit_code=0)
+
+        monkeypatch.setattr(agent.restic, "check_repo", fake_check)
+        monkeypatch.setattr(agent.restic, "init_repo", fake_init)
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(
+            agent.restic, "ResticRunner",
+            lambda source, destination, port=None, env=None: FakeRunner(source, destination, port, env),
+        )
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert probe_env["RESTIC_PASSWORD"] == "profile-secret"
+        assert init_env["RESTIC_PASSWORD"] == "profile-secret"
 
 
 class TestJobLock:

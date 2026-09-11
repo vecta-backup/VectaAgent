@@ -30,10 +30,12 @@ class ResticRunner:
         self,
         source: str,
         destination: str,
+        port: int | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
         self.source = source
         self.destination = destination
+        self.port = port
         self.env = env or {}
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
@@ -45,6 +47,7 @@ class ResticRunner:
             "restic",
             "backup",
             "--json",
+            *repo_options(self.destination, self.port),
             "--repo",
             self.destination,
             self.source,
@@ -121,6 +124,18 @@ class ResticRunner:
         return self._proc.returncode
 
 
+def repo_options(destination: str, port: int | None) -> list[str]:
+    """Extended restic options for a destination.
+
+    SFTP with a non-default port: `-o sftp.args="-p <port>"` sets the arguments
+    passed to the default SSH command (restic docs, SFTP backend). Ignored for
+    non-sftp destinations — their locations carry ports in their URL syntax.
+    """
+    if port is not None and destination.startswith("sftp:"):
+        return ["-o", f"sftp.args=-p {port}"]
+    return []
+
+
 def run_restic(args: list[str], env: dict[str, str] | None = None) -> ResticResult:
     """Run a one-shot restic command and capture exit code + stderr tail."""
     full_env = {**os.environ, **(env or {})}
@@ -163,14 +178,17 @@ def _looks_missing(stderr: str) -> bool:
     return False
 
 
-def check_repo(destination: str, env: dict[str, str] | None = None) -> RepoCheck:
+def check_repo(
+    destination: str, env: dict[str, str] | None = None, port: int | None = None
+) -> RepoCheck:
     """Probe whether a restic repository exists at `destination`.
 
     Uses `restic cat config`, whose exit code since restic 0.17 is 0 when the
     repo exists and 10 when it definitively does not. Any other exit code means
     the check is inconclusive and the caller must NOT initialize.
     """
-    result = run_restic(["cat", "config", "--repo", destination], env=env)
+    args = [*repo_options(destination, port), "cat", "config", "--repo", destination]
+    result = run_restic(args, env=env)
     if result.exit_code == 0:
         return RepoCheck(True)
     if result.exit_code == 10:
@@ -180,9 +198,12 @@ def check_repo(destination: str, env: dict[str, str] | None = None) -> RepoCheck
     return RepoCheck(None, result.stderr_tail)
 
 
-def init_repo(destination: str, env: dict[str, str] | None = None) -> ResticResult:
+def init_repo(
+    destination: str, env: dict[str, str] | None = None, port: int | None = None
+) -> ResticResult:
     """Initialize a new restic repository at `destination`."""
-    return run_restic(["init", "--repo", destination], env=env)
+    args = [*repo_options(destination, port), "init", "--repo", destination]
+    return run_restic(args, env=env)
 
 
 def parse_summary(obj: dict[str, Any]) -> dict[str, Any]:

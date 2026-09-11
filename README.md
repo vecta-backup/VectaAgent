@@ -58,6 +58,10 @@ pip install -e .
 |---------|-------------|
 | `vecta-agent register --token <TOKEN>` | Register this machine with Vecta |
 | `vecta-agent repo init <DEST>` | Initialize a restic repository at destination |
+| `vecta-agent repo init <DEST> --profile <NAME>` | Init and store the password in credential profile `<NAME>` |
+| `vecta-agent secret set <NAME>` | Create/update a local credential profile (`--generate`, `--password`, `--password-file`, `--env KEY=VALUE`) |
+| `vecta-agent secret list` | List profile names and their keys (never values) |
+| `vecta-agent secret remove <NAME>` | Delete a credential profile |
 | `vecta-agent run` | Execute due backup jobs (single pass) |
 | `vecta-agent version` | Show version |
 
@@ -79,7 +83,8 @@ Files are stored in `~/.config/vecta/`:
 | File | Contents | Permissions |
 |------|----------|-------------|
 | `config.toml` | `agent_id`, `api_key`, `name` | `chmod 600` |
-| `restic.env` | `RESTIC_PASSWORD` and cloud credentials | `chmod 600` |
+| `restic.env` | Global `RESTIC_PASSWORD` and cloud credentials (fallback for jobs without a profile) | `chmod 600` |
+| `secrets.toml` | Credential profiles — one `[profile-name]` section per destination, referenced by a job's `credential_profile` | `chmod 600` |
 
 ### restic.env
 
@@ -88,6 +93,24 @@ RESTIC_PASSWORD=...
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 ```
+
+### secrets.toml (credential profiles)
+
+Jobs reference secrets by profile name only — values never reach the backend:
+
+```toml
+[prod-s3]
+RESTIC_PASSWORD=...
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+
+[nas-sftp]
+RESTIC_PASSWORD=...
+```
+
+Per-job env resolution: process env → `restic.env` → the job's profile (profile wins). Each
+destination can have its own repository password. SFTP destinations use SSH keys; a job's
+`port` field is passed to restic as `-o sftp.args="-p <port>"`.
 
 **Important:** The repository password is the encryption key for your backups. It is **never** stored on the Vecta backend and **cannot be recovered**. Store it in a password manager.
 

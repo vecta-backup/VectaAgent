@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vecta_agent import api, config, restic
+from vecta_agent import api, config, restic, secrets
 
 logger = logging.getLogger("vecta_agent")
 
@@ -186,6 +186,60 @@ def _cancel_poller(
             break
 
 
+def _resolve_job_env(
+    client: api.ApiClient,
+    job_id: str,
+    job: dict[str, Any],
+    restic_env: dict[str, str],
+) -> dict[str, str] | None:
+    """Merge the global restic env with the job's credential profile.
+
+    Returns None after reporting a failure when the profile is missing or the
+    secrets file is malformed.
+    """
+    job_env = dict(restic_env)
+    profile_name = job.get("credential_profile")
+    if not profile_name:
+        return job_env
+
+    try:
+        profile = secrets.load_profile(profile_name)
+    except secrets.SecretsError as exc:
+        client.report_status(
+            job_id,
+            {
+                "job_id": job_id,
+                "status": "failed",
+                "exit_code": 1,
+                "message": f"Invalid credential profile '{profile_name}': {exc}",
+            },
+        )
+        logger.error("Job %s failed: invalid credential profile: %s", job_id, exc)
+        return None
+    if profile is None:
+        client.report_status(
+            job_id,
+            {
+                "job_id": job_id,
+                "status": "failed",
+                "exit_code": 1,
+                "message": (
+                    f"Credential profile '{profile_name}' is not configured on this "
+                    f"machine. Run 'vecta-agent secret set {profile_name}' on this machine."
+                ),
+            },
+        )
+        logger.error(
+            "Job %s failed: credential profile '%s' not found in %s.",
+            job_id,
+            profile_name,
+            secrets.secrets_path(),
+        )
+        return None
+    job_env.update(profile)
+    return job_env
+
+
 def _run_single_job(
     client: api.ApiClient,
     cfg: config.Config,
@@ -195,6 +249,7 @@ def _run_single_job(
     job_id = job["job_id"]
     source = job["source"]
     destination = job["destination"]
+    port = job.get("port")
 
     lock = JobLock(job_id)
     if not lock.acquire():
@@ -204,27 +259,39 @@ def _run_single_job(
         client.report_status(job_id, {"job_id": job_id, "status": "running"})
         logger.info("Starting job %s: %s -> %s", job_id, source, destination)
 
-        if not _has_repo_password(restic_env):
+        job_env = _resolve_job_env(client, job_id, job, restic_env)
+        if job_env is None:
+            return
+
+        if not _has_repo_password(job_env):
+            profile_name = job.get("credential_profile")
+            if profile_name:
+                hint = (
+                    f"Run 'vecta-agent secret set {profile_name}' on this machine "
+                    "to add RESTIC_PASSWORD to that profile."
+                )
+            else:
+                hint = (
+                    "Run 'vecta-agent repo init "
+                    f"{destination}' on this machine, or add RESTIC_PASSWORD to restic.env."
+                )
             client.report_status(
                 job_id,
                 {
                     "job_id": job_id,
                     "status": "failed",
                     "exit_code": 1,
-                    "message": (
-                        "No repository password configured. Run 'vecta-agent repo init "
-                        f"{destination}' on this machine, or add RESTIC_PASSWORD to restic.env."
-                    ),
+                    "message": f"No repository password configured. {hint}",
                 },
             )
             logger.error("Job %s failed: no repository password configured.", job_id)
             return
 
         try:
-            repo_check = restic.check_repo(destination, env=restic_env)
+            repo_check = restic.check_repo(destination, env=job_env, port=port)
             if repo_check.exists is False:
                 logger.info("Repository at %s not found; initializing.", destination)
-                init_result = restic.init_repo(destination, env=restic_env)
+                init_result = restic.init_repo(destination, env=job_env, port=port)
                 if init_result.exit_code != 0:
                     client.report_status(
                         job_id,
@@ -276,7 +343,7 @@ def _run_single_job(
             return
 
         start_time = time.monotonic()
-        runner = restic.ResticRunner(source, destination, env=restic_env)
+        runner = restic.ResticRunner(source, destination, port=port, env=job_env)
         try:
             runner.start()
         except FileNotFoundError:
