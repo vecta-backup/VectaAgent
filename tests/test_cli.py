@@ -1,13 +1,13 @@
 import pytest
 
-from vecta_agent import api, cli, config, restic
+from vecta_agent import __version__, api, cli, config, restic
 
 
 class TestCli:
     def test_version(self, capsys):
         cli.main(["version"])
         captured = capsys.readouterr()
-        assert captured.out.strip() == "0.2.0"
+        assert captured.out.strip() == __version__
 
     def test_register(self, tmp_config_dir, monkeypatch, capsys):
         calls = []

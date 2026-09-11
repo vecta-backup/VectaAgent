@@ -10,18 +10,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: python:3.12-slim-bullseye
+    container: quay.io/pypa/manylinux_2_28_x86_64:latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Check-Date=false update && apt-get install -y binutils && rm -rf /var/lib/apt/lists/*
-
       - name: Install Python dependencies
-        run: pip install pyinstaller -r requirements.txt
+        run: /opt/python/cp312-cp312/bin/python -m pip install pyinstaller -r requirements.txt
 
       - name: Build binary
-        run: pyinstaller vecta-agent.spec
+        run: /opt/python/cp312-cp312/bin/python -m PyInstaller vecta-agent.spec
 
       - name: Generate checksums
         run: |
