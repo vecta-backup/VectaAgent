@@ -64,6 +64,7 @@ pip install -e .
 | `vecta-agent secret remove <NAME>` | Delete a credential profile |
 | `vecta-agent run` | Execute due backup jobs (single pass) |
 | `vecta-agent version` | Show version |
+| `vecta-agent update` | Update the installed binary to the latest GitHub release (`--check` to compare only, `--version vX.Y.Z` to pin) |
 
 ### Repository initialization
 

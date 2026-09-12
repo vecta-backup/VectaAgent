@@ -8,6 +8,8 @@ from typing import Any
 
 import httpx
 
+from vecta_agent import __version__
+
 BASE_URL = os.environ.get("VECTA_BASE_URL", "https://vectaapp.com/api")
 
 
@@ -72,7 +74,7 @@ class ApiClient:
         auth: bool = True,
         max_retries: int = 3,
     ) -> httpx.Response:
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {"X-Vecta-Agent-Version": __version__}
         if auth:
             headers["Authorization"] = self._auth_header
 

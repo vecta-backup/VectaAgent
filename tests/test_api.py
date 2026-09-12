@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from vecta_agent import api
+from vecta_agent import __version__, api
 
 
 def _resp(method, url, status=200, json=None, text=""):
@@ -24,7 +24,21 @@ class TestApiClient:
         result = client.register("tok")
         assert result["agent_id"] == "a1"
         assert calls[0][0] == "POST"
+        assert calls[0][2]["X-Vecta-Agent-Version"] == __version__
         assert calls[0][3] == {"registration_token": "tok"}
+
+    def test_sends_version_header_on_authed_requests(self, monkeypatch):
+        calls = []
+
+        def fake_request(method, url, headers=None, json=None):
+            calls.append(headers)
+            return _resp(method, url, 200, {"agent_id": "a1", "name": "n1", "is_active": True})
+
+        monkeypatch.setattr(api.httpx, "Client", lambda **kw: _FakeClient(fake_request))
+        client = api.ApiClient("a1", "vc_k1", base_url="http://test/api")
+        client.me()
+        assert calls[0]["X-Vecta-Agent-Version"] == __version__
+        assert calls[0]["Authorization"] == "Bearer vc_k1"
 
     def test_register_token_used(self, monkeypatch):
         def fake_request(method, url, headers=None, json=None):

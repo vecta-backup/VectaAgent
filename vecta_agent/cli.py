@@ -9,7 +9,7 @@ import secrets
 import sys
 from pathlib import Path
 
-from vecta_agent import __version__, agent, api, config, restic
+from vecta_agent import __version__, agent, api, config, restic, update
 from vecta_agent import secrets as secret_store
 
 logger = logging.getLogger("vecta_agent")
@@ -214,6 +214,10 @@ def run_version(_args: argparse.Namespace) -> None:
     print(__version__)
 
 
+def run_update(args: argparse.Namespace) -> None:
+    update.run_update(requested_version=args.version, check_only=args.check)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="vecta-agent")
     parser.add_argument("--version", action="version", version=__version__)
@@ -290,6 +294,21 @@ def main(argv: list[str] | None = None) -> None:
     version_parser = subparsers.add_parser("version", help="Show version")
     version_parser.set_defaults(func=run_version)
 
+    update_parser = subparsers.add_parser(
+        "update", help="Update vecta-agent to the latest GitHub release"
+    )
+    update_parser.add_argument(
+        "--version",
+        metavar="vX.Y.Z",
+        help="Install a specific release instead of the latest one",
+    )
+    update_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only report whether an update is available; do not install",
+    )
+    update_parser.set_defaults(func=run_update)
+
     args = parser.parse_args(argv)
     _setup_logging()
     try:
@@ -312,6 +331,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except api.ApiError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except update.UpdateError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except Exception as exc:  # pragma: no cover
