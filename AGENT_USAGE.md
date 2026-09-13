@@ -148,7 +148,8 @@ jobs = fetch due jobs from the backend
 if none: exit
 
 for each job:
-    report "running"
+    run_id = new UUID
+    report "running" (with run_id)
     if no repository password configured:
         report "failed" -> "No repository password configured. Run 'vecta-agent setup <JOB_ID>' ..."
         next job
@@ -159,7 +160,10 @@ for each job:
         - indeterminate -> report "failed" (do NOT initialize)
 
     run restic backup (source -> destination), streaming progress + polling cancel
-    report "success" (with snapshot id, counts, bytes) or "failed" (with stderr tail)
+    a watchdog kills restic after 12h and reports a distinct timeout failure
+    report "success" (with snapshot id, counts, bytes),
+           "warning" (backup completed but zero files were scanned — check the source path),
+           or "failed" (with stderr tail)
 ```
 
 Key points:

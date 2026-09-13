@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,13 @@ logger = logging.getLogger("vecta_agent")
 
 PROGRESS_INTERVAL_SECONDS = 10
 CANCEL_INTERVAL_SECONDS = 10
+
+# Hard cap on a single restic backup invocation. A hung restic process (or a
+# suspended machine) would otherwise keep the job "running" forever. When the
+# cap is hit the process is terminated via the same SIGTERM-then-SIGKILL path
+# used for user cancellation and the run is reported as a distinct timeout
+# failure. Fixed on purpose — not user-configurable for now.
+MAX_BACKUP_DURATION_SECONDS = 12 * 60 * 60
 
 # Substrings (case-insensitive) in restic's stderr that indicate an
 # authentication failure rather than e.g. a network problem. The hint is
@@ -166,6 +174,7 @@ def _auth_failure_hint(stderr: str, job_id: str) -> str:
 def _progress_reporter(
     client: api.ApiClient,
     job_id: str,
+    run_id: str,
     start_time: float,
     stats: dict[str, Any],
     done_event: threading.Event,
@@ -175,6 +184,7 @@ def _progress_reporter(
         with threading.Lock():
             payload: dict[str, Any] = {
                 "job_id": job_id,
+                "run_id": run_id,
                 "status": "running",
                 "duration_seconds": int(time.monotonic() - start_time),
                 "files_processed": stats.get("files_processed"),
@@ -219,11 +229,37 @@ def _cancel_poller(
             break
 
 
+def _timeout_message() -> str:
+    """Human-readable timeout failure reason, derived from the constant."""
+    hours = MAX_BACKUP_DURATION_SECONDS / 3600
+    if hours >= 1:
+        return f"Backup timed out after {hours:g}h and was terminated."
+    return f"Backup timed out after {MAX_BACKUP_DURATION_SECONDS:g}s and was terminated."
+
+
+def _timeout_watchdog(
+    runner: restic.ResticRunner,
+    timeout_event: threading.Event,
+    done_event: threading.Event,
+) -> None:
+    """Terminate restic if a single backup invocation exceeds the max duration.
+
+    Reuses the cancellation terminate path (SIGTERM, then SIGKILL); the main
+    loop notices via timeout_event and reports a distinct timeout failure.
+    """
+    if done_event.wait(MAX_BACKUP_DURATION_SECONDS):
+        return
+    timeout_event.set()
+    runner.terminate()
+    logger.warning("Job exceeded the maximum duration; terminating restic. %s", _timeout_message())
+
+
 def _resolve_job_env(
     client: api.ApiClient,
     job_id: str,
     job: dict[str, Any],
     restic_env: dict[str, str],
+    run_id: str,
 ) -> dict[str, str] | None:
     """Merge the global restic env with the destination's stored credentials.
 
@@ -242,6 +278,7 @@ def _resolve_job_env(
             job_id,
             {
                 "job_id": job_id,
+                "run_id": run_id,
                 "status": "failed",
                 "exit_code": 1,
                 "message": f"Invalid local credentials file: {exc}",
@@ -265,15 +302,22 @@ def _run_single_job(
     destination = job["destination"]
     port = job.get("port")
 
+    # Identifies this invocation end-to-end: the backend keys the in-flight
+    # "running" log row (and its final terminal update) on it, so two runs of
+    # the same job can never be conflated into one log entry.
+    run_id = uuid.uuid4().hex
+
     lock = JobLock(job_id)
     if not lock.acquire():
         return
 
     try:
-        client.report_status(job_id, {"job_id": job_id, "status": "running"})
+        client.report_status(
+            job_id, {"job_id": job_id, "run_id": run_id, "status": "running"}
+        )
         logger.info("Starting job %s: %s -> %s", job_id, source, destination)
 
-        job_env = _resolve_job_env(client, job_id, job, restic_env)
+        job_env = _resolve_job_env(client, job_id, job, restic_env, run_id)
         if job_env is None:
             return
 
@@ -282,6 +326,7 @@ def _run_single_job(
                 job_id,
                 {
                     "job_id": job_id,
+                    "run_id": run_id,
                     "status": "failed",
                     "exit_code": 1,
                     "message": (
@@ -304,6 +349,7 @@ def _run_single_job(
                         job_id,
                         {
                             "job_id": job_id,
+                            "run_id": run_id,
                             "status": "failed",
                             "exit_code": init_result.exit_code,
 "message": (init_result.stderr_tail or "Failed to initialize repository.")
@@ -323,6 +369,7 @@ def _run_single_job(
                     job_id,
                     {
                         "job_id": job_id,
+                        "run_id": run_id,
                         "status": "failed",
                         "exit_code": 1,
                         "message": (repo_check.stderr_tail or "Could not verify repository at destination.")
@@ -341,6 +388,7 @@ def _run_single_job(
                 job_id,
                 {
                     "job_id": job_id,
+                    "run_id": run_id,
                     "status": "failed",
                     "exit_code": 127,
                     "message": "restic binary not found in PATH",
@@ -358,6 +406,7 @@ def _run_single_job(
                 job_id,
                 {
                     "job_id": job_id,
+                    "run_id": run_id,
                     "status": "failed",
                     "exit_code": 127,
                     "message": "restic executable not found on PATH; install restic to run backups",
@@ -368,11 +417,12 @@ def _run_single_job(
 
         stats: dict[str, Any] = {}
         cancel_event = threading.Event()
+        timeout_event = threading.Event()
         done_event = threading.Event()
 
         progress_thread = threading.Thread(
             target=_progress_reporter,
-            args=(client, job_id, start_time, stats, done_event),
+            args=(client, job_id, run_id, start_time, stats, done_event),
             daemon=True,
         )
         cancel_thread = threading.Thread(
@@ -380,8 +430,14 @@ def _run_single_job(
             args=(client, job_id, cancel_event, done_event, runner),
             daemon=True,
         )
+        timeout_thread = threading.Thread(
+            target=_timeout_watchdog,
+            args=(runner, timeout_event, done_event),
+            daemon=True,
+        )
         progress_thread.start()
         cancel_thread.start()
+        timeout_thread.start()
 
         try:
             for obj in runner.stream():
@@ -394,17 +450,20 @@ def _run_single_job(
                 elif msg_type == "summary":
                     summary = restic.parse_summary(obj)
                     stats.update(summary)
+                    stats["_summary_seen"] = True
         finally:
             exit_code = runner.wait()
             done_event.set()
             progress_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
             cancel_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
+            timeout_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
 
         duration = int(time.monotonic() - start_time)
 
         if cancel_event.is_set():
             payload = {
                 "job_id": job_id,
+                "run_id": run_id,
                 "status": "failed",
                 "exit_code": 130,
                 "message": "Cancelled by user",
@@ -414,12 +473,38 @@ def _run_single_job(
             logger.info("Job %s cancelled.", job_id)
             return
 
-        if exit_code == 0:
+        if timeout_event.is_set():
             payload = {
                 "job_id": job_id,
-                "status": "success",
+                "run_id": run_id,
+                "status": "failed",
+                "exit_code": 124,
+                "message": _timeout_message(),
+                "duration_seconds": duration,
+            }
+            client.report_status(job_id, payload)
+            logger.error("Job %s %s", job_id, _timeout_message())
+            return
+
+        if exit_code == 0:
+            # Zero files scanned means the source path was empty, missing, or
+            # matched nothing. Zero NEW files with a nonzero scan count is
+            # normal dedup behavior and must NOT be flagged — hence this
+            # checks only total files processed, and only when restic's
+            # summary event actually reported it.
+            zero_files = bool(stats.get("_summary_seen")) and stats.get("files_processed") == 0
+            payload = {
+                "job_id": job_id,
+                "run_id": run_id,
+                "status": "warning" if zero_files else "success",
                 "exit_code": 0,
-                "message": "Backup completed",
+                "message": (
+                    "Backup completed but no files were processed. The source "
+                    "path may be empty, missing, or wrong — check the job's "
+                    "source path."
+                    if zero_files
+                    else "Backup completed"
+                ),
                 "duration_seconds": duration,
                 "snapshot_id": stats.get("snapshot_id"),
                 "files_processed": stats.get("files_processed"),
@@ -427,10 +512,14 @@ def _run_single_job(
                 "transferred_bytes": stats.get("transferred_bytes"),
             }
             client.report_status(job_id, payload)
-            logger.info("Job %s succeeded (snapshot %s).", job_id, stats.get("snapshot_id"))
+            if zero_files:
+                logger.warning("Job %s completed with no files processed.", job_id)
+            else:
+                logger.info("Job %s succeeded (snapshot %s).", job_id, stats.get("snapshot_id"))
         else:
             payload = {
                 "job_id": job_id,
+                "run_id": run_id,
                 "status": "failed",
                 "exit_code": exit_code,
                 "message": (runner.stderr_tail() or f"restic exited with code {exit_code}")

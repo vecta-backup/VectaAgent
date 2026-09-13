@@ -190,6 +190,145 @@ class TestRunAgent:
         assert failure["exit_code"] == 130
         assert failure["message"] == "Cancelled by user"
 
+    def test_job_timeout_reports_distinct_failure(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jt", "source": "/src", "destination": "/dest"}]
+        runners = []
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.status_count = 1000  # would never finish on its own
+            runners.append(r)
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "MAX_BACKUP_DURATION_SECONDS", 0.2)
+
+        agent.run_agent()
+
+        assert runners[0].terminated is True
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 124
+        assert "timed out" in failure["message"]
+
+    def test_run_id_present_and_stable_across_reports(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jr", "source": "/src", "destination": "/dest"}]
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {"message_type": "summary", "snapshot_id": "s1"}
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert len(fake.status_reports) >= 2
+        run_ids = {r.get("run_id") for r in fake.status_reports}
+        assert len(run_ids) == 1
+        assert run_ids.pop()  # non-empty
+
+    def test_zero_files_processed_reports_warning(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jz", "source": "/src", "destination": "/dest"}]
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {
+                "message_type": "summary",
+                "snapshot_id": "snap0",
+                "total_files_processed": 0,
+                "total_bytes_processed": 0,
+                "data_added_packed": 0,
+            }
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        report = fake.status_reports[-1]
+        assert report["status"] == "warning"
+        assert report["exit_code"] == 0
+        assert report["snapshot_id"] == "snap0"
+        assert report["files_processed"] == 0
+        assert "no files were processed" in report["message"]
+
+    def test_zero_new_files_but_processed_reports_success(self, tmp_config_dir, monkeypatch):
+        # Healthy dedup: restic scanned files but added nothing new. Must stay
+        # a plain success — only zero total-processed may be flagged.
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jd", "source": "/src", "destination": "/dest"}]
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {
+                "message_type": "summary",
+                "snapshot_id": "snapd",
+                "files_new": 0,
+                "total_files_processed": 25,
+                "total_bytes_processed": 5000,
+                "data_added_packed": 0,
+            }
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        report = fake.status_reports[-1]
+        assert report["status"] == "success"
+        assert report["files_processed"] == 25
+
+    def test_zero_files_from_status_events_without_summary_reports_success(self, tmp_config_dir, monkeypatch):
+        # Without a summary event we cannot distinguish "scanned nothing" from
+        # "not finished reporting" — never flag on status-event counts alone.
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jn", "source": "/src", "destination": "/dest"}]
+
+        class NoSummaryRunner(FakeRunner):
+            def stream(self):
+                yield {
+                    "message_type": "status",
+                    "percent_done": 0.0,
+                    "files_done": 0,
+                    "bytes_done": 0,
+                }
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", lambda *a, **kw: NoSummaryRunner("/src", "/dest"))
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        report = fake.status_reports[-1]
+        assert report["status"] == "success"
+
     def test_auth_error_exits(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
 
