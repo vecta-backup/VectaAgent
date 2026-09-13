@@ -1,3 +1,5 @@
+import subprocess
+
 import pytest
 
 from vecta_agent import __version__, api, cli, config, credentials, restic
@@ -394,6 +396,7 @@ class TestSetup:
         class FakeProc:
             returncode = 255
             stderr = "Permission denied (publickey)."
+            stdout = ""
 
         monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: FakeProc())
 
@@ -404,7 +407,29 @@ class TestSetup:
         err = capsys.readouterr().err
         assert "Permission denied" in err
         assert "ssh-copy-id -p 2222 ops@nas" in err
-        assert "ssh -p 2222 ops@nas" in err
+        assert "sftp -P 2222 ops@nas" in err
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_sftp_connectivity_timeout_fails_cleanly(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp:ops@nas:/backups"
+        self._install_client(
+            monkeypatch,
+            {"job_id": "j1", "source": "/src", "destination": dest, "port": 2222},
+        )
+
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 20))
+
+        monkeypatch.setattr(cli.subprocess, "run", hang)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "timed out" in err
+        assert "ssh-copy-id -p 2222 ops@nas" in err
         assert not (tmp_config_dir / "credentials.toml").exists()
 
     def test_sftp_connectivity_ok_then_inits(self, tmp_config_dir, monkeypatch, capsys):
@@ -418,10 +443,11 @@ class TestSetup:
         class FakeProc:
             returncode = 0
             stderr = ""
+            stdout = ""
 
-        ssh_cmds = []
+        ssh_calls = []
         monkeypatch.setattr(
-            cli.subprocess, "run", lambda cmd, **kw: ssh_cmds.append(cmd) or FakeProc()
+            cli.subprocess, "run", lambda cmd, **kw: ssh_calls.append((cmd, kw)) or FakeProc()
         )
         monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
         monkeypatch.setattr(
@@ -434,9 +460,12 @@ class TestSetup:
         out = capsys.readouterr().out
         assert "SSH key authentication" in out
         assert "Generated repository password:" in out
-        assert ssh_cmds[0][0] == "ssh"
-        assert "-p" in ssh_cmds[0] and "2222" in ssh_cmds[0]
-        assert "ops@nas" in ssh_cmds[0]
+        cmd, kwargs = ssh_calls[0]
+        assert cmd[0] == "ssh"
+        assert "-p" in cmd and "2222" in cmd
+        assert cmd[-3:] == ["-s", "sftp", "ops@nas"]
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["timeout"] == 20
         saved = credentials.load_credentials(credentials.destination_fingerprint(dest))
         assert saved["RESTIC_PASSWORD"]
 
@@ -453,6 +482,7 @@ class TestSetup:
         class FakeProc:
             returncode = 0
             stderr = ""
+            stdout = ""
 
         monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: FakeProc())
         monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))

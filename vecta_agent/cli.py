@@ -162,9 +162,13 @@ def _sftp_connection(destination: str) -> str:
 def _check_sftp_connectivity(destination: str, port: int | None) -> tuple[bool, str]:
     """Non-interactive SSH key-auth probe: exit 0 means key auth works.
 
+    Requests the sftp subsystem — exactly what restic uses — instead of an
+    exec session, so sftp-only servers (ForceCommand internal-sftp) pass.
     BatchMode=yes disables any password prompt; accept-new records a first
     contact host key (TOFU) so the later restic run does not need a prompt,
-    while changed host keys still hard-fail.
+    while changed host keys still hard-fail. stdin is closed immediately so
+    the sftp server sees EOF and exits; the timeout guards against servers
+    that neither refuse nor close the session.
     """
     cmd = [
         "ssh",
@@ -177,13 +181,21 @@ def _check_sftp_connectivity(destination: str, port: int | None) -> tuple[bool, 
     ]
     if port is not None:
         cmd += ["-p", str(port)]
-    cmd += [_sftp_connection(destination), "exit"]
+    cmd += ["-s", "sftp", _sftp_connection(destination)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=20,
+        )
     except FileNotFoundError:
         print("Error: ssh executable not found on PATH.", file=sys.stderr)
         raise SystemExit(1)
-    return result.returncode == 0, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "SSH session timed out after 20 seconds."
+    return result.returncode == 0, (result.stderr or "") + (result.stdout or "")
 
 
 def _print_sftp_fix_commands(destination: str, port: int | None, stderr: str) -> None:
@@ -196,7 +208,7 @@ def _print_sftp_fix_commands(destination: str, port: int | None, stderr: str) ->
         "\nSet up SSH keys on this machine, then re-run this command:\n"
         "  ssh-keygen -t ed25519                  # skip if you already have a key\n"
         f"  ssh-copy-id -p {ssh_port} {connection}\n"
-        f"  ssh -p {ssh_port} {connection}         # must log in without a password prompt\n",
+        f"  sftp -P {ssh_port} {connection}        # must connect without a password prompt\n",
         file=sys.stderr,
     )
     print("Then re-run: vecta-agent setup <job-id>", file=sys.stderr)
