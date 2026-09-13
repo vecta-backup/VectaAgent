@@ -159,11 +159,42 @@ def _sftp_connection(destination: str) -> str:
     return connection
 
 
+def _validate_sftp_destination(destination: str) -> None:
+    """Fail fast on destinations restic's parser would reject.
+
+    restic requires a directory for both formats: the legacy format must have
+    a colon before the path (sftp:user@host:/path), the URL format a path
+    (sftp://user@host[:port]/path). Without it the connectivity probe would
+    pass and the later restic run would die with a cryptic parse error.
+    """
+    d = destination.strip()
+    if d.startswith("sftp://"):
+        if "/" not in d[len("sftp://"):]:
+            print(
+                f"Error: invalid SFTP destination {destination!r}. Use the "
+                "sftp://user@host[:port]/path format — a path after the host "
+                "is required.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        return
+    if ":" not in d[len("sftp:"):]:
+        print(
+            f"Error: invalid SFTP destination {destination!r}. Use the "
+            "sftp:user@host:/path format — a colon before the path is "
+            "required.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
 def _check_sftp_connectivity(destination: str, port: int | None) -> tuple[bool, str]:
     """Non-interactive SSH key-auth probe: exit 0 means key auth works.
 
     Requests the sftp subsystem — exactly what restic uses — instead of an
     exec session, so sftp-only servers (ForceCommand internal-sftp) pass.
+    The subsystem name is the trailing argument: ssh's -s flag is boolean,
+    so `ssh -s sftp host` would try to connect to a host named "sftp".
     BatchMode=yes disables any password prompt; accept-new records a first
     contact host key (TOFU) so the later restic run does not need a prompt,
     while changed host keys still hard-fail. stdin is closed immediately so
@@ -181,7 +212,7 @@ def _check_sftp_connectivity(destination: str, port: int | None) -> tuple[bool, 
     ]
     if port is not None:
         cmd += ["-p", str(port)]
-    cmd += ["-s", "sftp", _sftp_connection(destination)]
+    cmd += ["-s", _sftp_connection(destination), "sftp"]
     try:
         result = subprocess.run(
             cmd,
@@ -284,6 +315,7 @@ def run_setup(args: argparse.Namespace) -> None:
         )
     elif kind == "sftp":
         # SFTP auth is SSH keys only; verify connectivity instead of prompting.
+        _validate_sftp_destination(destination)
         ok, stderr = _check_sftp_connectivity(destination, port)
         if not ok:
             _print_sftp_fix_commands(destination, port, stderr)

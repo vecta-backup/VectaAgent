@@ -123,7 +123,7 @@ working off `restic.env` / process env / instance roles.
 | `/path/to/repo` (local) | repository password (generated) | Nothing else needed. |
 | `s3:https://<endpoint>/<bucket>` | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (hidden input) + generated repo password | R2/Wasabi/Minio work the same way. |
 | `b2:<bucket>:<path>` | `B2_ACCOUNT_ID` + `B2_ACCOUNT_KEY` (hidden input) + generated repo password | restic recommends the S3-compatible API for B2. |
-| `sftp:user@host:/path` | nothing — SSH keys only | `setup` runs a non-interactive SSH key-auth probe that requests the sftp subsystem (`ssh -o BatchMode=yes -s sftp`), so sftp-only servers pass; on failure it prints `ssh-keygen` / `ssh-copy-id -p <port> user@host` fix commands. Non-default ports come from the job's `port` field and are passed to restic as `-o sftp.command="ssh -p <port> <user>@<host> -s sftp"`. |
+| `sftp:user@host:/path` | nothing — SSH keys only | The colon before the path is required. `setup` validates the destination format, then runs a non-interactive SSH key-auth probe that requests the sftp subsystem (`ssh -o BatchMode=yes -s <user>@<host> sftp`), so sftp-only servers pass; on failure it prints `ssh-keygen` / `ssh-copy-id -p <port> user@host` fix commands. Non-default ports come from the job's `port` field and are passed to restic as `-o sftp.command="ssh -p <port> <user>@<host> -s sftp"`. |
 
 ---
 

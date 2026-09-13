@@ -432,6 +432,44 @@ class TestSetup:
         assert "ssh-copy-id -p 2222 ops@nas" in err
         assert not (tmp_config_dir / "credentials.toml").exists()
 
+    def test_sftp_destination_without_path_fails_fast(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp:ops@nas/upload/repo"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        def no_ssh(*a, **kw):
+            raise AssertionError("the probe must not run for a malformed destination")
+
+        monkeypatch.setattr(cli.subprocess, "run", no_ssh)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "invalid SFTP destination" in err
+        assert "sftp:user@host:/path" in err
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_sftp_url_destination_without_path_fails_fast(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp://ops@nas:2222"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        def no_ssh(*a, **kw):
+            raise AssertionError("the probe must not run for a malformed destination")
+
+        monkeypatch.setattr(cli.subprocess, "run", no_ssh)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "invalid SFTP destination" in err
+        assert "sftp://user@host[:port]/path" in err
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
     def test_sftp_connectivity_ok_then_inits(self, tmp_config_dir, monkeypatch, capsys):
         make_config(tmp_config_dir)
         dest = "sftp:ops@nas:/backups"
@@ -463,7 +501,7 @@ class TestSetup:
         cmd, kwargs = ssh_calls[0]
         assert cmd[0] == "ssh"
         assert "-p" in cmd and "2222" in cmd
-        assert cmd[-3:] == ["-s", "sftp", "ops@nas"]
+        assert cmd[-3:] == ["-s", "ops@nas", "sftp"]
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["timeout"] == 20
         saved = credentials.load_credentials(credentials.destination_fingerprint(dest))
