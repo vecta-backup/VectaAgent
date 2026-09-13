@@ -6,11 +6,11 @@ import argparse
 import getpass
 import logging
 import secrets
+import subprocess
 import sys
 from pathlib import Path
 
-from vecta_agent import __version__, agent, api, config, restic, update
-from vecta_agent import secrets as secret_store
+from vecta_agent import __version__, agent, api, config, credentials, restic, update
 
 logger = logging.getLogger("vecta_agent")
 
@@ -47,9 +47,9 @@ def run_run(_args: argparse.Namespace) -> None:
 
 
 def _resolve_password(args) -> str | None:
-    """Shared password acquisition for `repo init` and `secret set`.
+    """Password acquisition for `repo init`.
 
-    Returns None when no password was requested/provided (e.g. --env only).
+    Returns None when no password was requested/provided (prompt instead).
     """
     password = args.password
     if args.password_file:
@@ -70,7 +70,6 @@ def _resolve_password(args) -> str | None:
 
 def run_repo_init(args: argparse.Namespace) -> None:
     destination = args.destination
-    profile = args.profile
     password = _resolve_password(args)
     if password is None:
         password = getpass.getpass("Repository password: ")
@@ -81,14 +80,6 @@ def run_repo_init(args: argparse.Namespace) -> None:
 
     config_dir = config._config_dir()
     env = {**agent.load_restic_env(config_dir), "RESTIC_PASSWORD": password}
-    if profile:
-        try:
-            existing = secret_store.load_profile(profile)
-        except secret_store.SecretsError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
-        if existing:
-            env.update(existing)
 
     try:
         result = restic.init_repo(destination, env=env)
@@ -100,17 +91,12 @@ def run_repo_init(args: argparse.Namespace) -> None:
         raise SystemExit(1)
     if result.exit_code == 0:
         try:
-            if profile:
-                secret_store.save_profile(profile, {"RESTIC_PASSWORD": password})
-                saved_to = f"{config_dir / secret_store.SECRETS_FILENAME} (profile '{profile}')"
-            else:
-                agent.save_restic_env({"RESTIC_PASSWORD": password}, config_dir)
-                saved_to = str(config_dir / "restic.env")
-        except (OSError, secret_store.SecretsError) as exc:
-            target = f"profile '{profile}'" if profile else str(config_dir / "restic.env")
+            agent.save_restic_env({"RESTIC_PASSWORD": password}, config_dir)
+            saved_to = str(config_dir / "restic.env")
+        except OSError as exc:
             print(
                 "Error: repository initialized, but the password could not be saved to "
-                f"{target}: {exc}. Save RESTIC_PASSWORD there manually.",
+                f"{config_dir / 'restic.env'}: {exc}. Save RESTIC_PASSWORD there manually.",
                 file=sys.stderr,
             )
             raise SystemExit(1)
@@ -123,83 +109,260 @@ def run_repo_init(args: argparse.Namespace) -> None:
         return
     if _already_initialized(result.stderr_tail):
         print(f"Repository at {destination} is already initialized.")
-        if profile:
-            print(
-                "To use an existing repository from this machine, set RESTIC_PASSWORD in "
-                f"profile '{profile}' (vecta-agent secret set {profile})."
-            )
-        else:
-            print(
-                "To use an existing repository from this machine, set RESTIC_PASSWORD in "
-                "restic.env to that repository's password."
-            )
+        print(
+            "To use an existing repository from this machine, set RESTIC_PASSWORD in "
+            "restic.env to that repository's password."
+        )
         return
     print(f"Error: restic init failed: {result.stderr_tail}", file=sys.stderr)
     raise SystemExit(1)
 
 
-def run_secret_set(args: argparse.Namespace) -> None:
-    name = args.profile
-    entries: dict[str, str] = {}
-    for kv in args.env or []:
-        key, sep, value = kv.partition("=")
-        if not key or not sep or not value:
-            print(
-                f"Error: --env expects KEY=VALUE (got {kv!r}).", file=sys.stderr
-            )
-            raise SystemExit(1)
-        entries[key] = value
+# --- `vecta-agent setup` ---------------------------------------------------
 
-    password = _resolve_password(args)
-    if password is None and not entries:
-        password = getpass.getpass("Repository password: ")
-        confirm = getpass.getpass("Confirm repository password: ")
-        if password != confirm:
-            print("Error: passwords do not match.", file=sys.stderr)
-            raise SystemExit(1)
-    if password is not None:
-        entries["RESTIC_PASSWORD"] = password
+# Prompted credential fields per destination kind: (env var, prompt label).
+# SFTP is absent on purpose: restic shells out to ssh and can only use SSH
+# keys/agent auth — there is no restic-consumable SFTP password to store.
+_DESTINATION_PROMPTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "s3": (
+        ("AWS_ACCESS_KEY_ID", "S3 access key ID"),
+        ("AWS_SECRET_ACCESS_KEY", "S3 secret access key"),
+    ),
+    "b2": (
+        ("B2_ACCOUNT_ID", "B2 account ID"),
+        ("B2_ACCOUNT_KEY", "B2 account key"),
+    ),
+}
 
-    if not entries:
+
+def _destination_kind(destination: str) -> str:
+    scheme = destination.strip().split(":", 1)[0]
+    if scheme in ("s3", "b2", "sftp"):
+        return scheme
+    return "other"
+
+
+def _sftp_connection(destination: str) -> str:
+    """The user@host part of a legacy-format sftp destination.
+
+    Raises SystemExit when the destination cannot be parsed — surfaced loudly
+    instead of silently dropping the SSH port.
+    """
+    connection = destination.strip()[len("sftp:"):].split(":", 1)[0]
+    if not connection:
         print(
-            "Error: provide a password or at least one --env KEY=VALUE.", file=sys.stderr
+            f"Error: could not parse the SFTP destination {destination!r}. "
+            "Use the sftp:user@host:/path format.",
+            file=sys.stderr,
         )
         raise SystemExit(1)
+    return connection
 
+
+def _check_sftp_connectivity(destination: str, port: int | None) -> tuple[bool, str]:
+    """Non-interactive SSH key-auth probe: exit 0 means key auth works.
+
+    BatchMode=yes disables any password prompt; accept-new records a first
+    contact host key (TOFU) so the later restic run does not need a prompt,
+    while changed host keys still hard-fail.
+    """
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if port is not None:
+        cmd += ["-p", str(port)]
+    cmd += [_sftp_connection(destination), "exit"]
     try:
-        path = secret_store.save_profile(name, entries)
-    except secret_store.SecretsError as exc:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("Error: ssh executable not found on PATH.", file=sys.stderr)
+        raise SystemExit(1)
+    return result.returncode == 0, result.stderr
+
+
+def _print_sftp_fix_commands(destination: str, port: int | None, stderr: str) -> None:
+    connection = _sftp_connection(destination)
+    ssh_port = str(port) if port is not None else "22"
+    print("SSH key authentication to the SFTP destination failed:", file=sys.stderr)
+    if stderr.strip():
+        print(stderr.strip(), file=sys.stderr)
+    print(
+        "\nSet up SSH keys on this machine, then re-run this command:\n"
+        "  ssh-keygen -t ed25519                  # skip if you already have a key\n"
+        f"  ssh-copy-id -p {ssh_port} {connection}\n"
+        f"  ssh -p {ssh_port} {connection}         # must log in without a password prompt\n",
+        file=sys.stderr,
+    )
+    print("Then re-run: vecta-agent setup <job-id>", file=sys.stderr)
+
+
+def _prompt_destination_credentials(destination: str) -> dict[str, str]:
+    """Prompt (hidden input) for the credential fields the destination needs."""
+    prompts = _DESTINATION_PROMPTS.get(_destination_kind(destination), ())
+    entries: dict[str, str] = {}
+    for key, label in prompts:
+        value = getpass.getpass(f"{label} ({key}): ")
+        if not value:
+            print(f"Error: {key} is required for this destination type.", file=sys.stderr)
+            raise SystemExit(1)
+        entries[key] = value
+    return entries
+
+
+def _prompt_password_twice() -> str:
+    password = getpass.getpass("Repository password: ")
+    confirm = getpass.getpass("Confirm repository password: ")
+    if password != confirm:
+        print("Error: passwords do not match.", file=sys.stderr)
+        raise SystemExit(1)
+    if not password:
+        print(
+            "Error: a non-empty password is required (restic rejects empty passwords).",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    return password
+
+
+def _confirm_password_saved() -> None:
+    """Blocking gate: the generated password must be acknowledged as stored."""
+    while True:
+        answer = input(
+            "Type SAVED to confirm you have stored this password in a password manager: "
+        )
+        if answer.strip() == "SAVED":
+            return
+        print(
+            "The repository cannot be recovered without this password. "
+            "Type SAVED to continue."
+        )
+
+
+def run_setup(args: argparse.Namespace) -> None:
+    job_id = args.job_id
+    cfg = config.load()
+    client = api.ApiClient(cfg.agent_id, cfg.api_key)
+    job = client.get_job(job_id)
+    destination = job["destination"]
+    port = job.get("port")
+    kind = _destination_kind(destination)
+    fingerprint = credentials.destination_fingerprint(destination)
+    config_dir = config._config_dir()
+
+    env = {**agent.load_restic_env(config_dir)}
+    stored = None
+    try:
+        stored = credentials.load_credentials(fingerprint)
+    except credentials.CredentialsError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-    print(f"Profile '{name}' saved to {path}.")
-    print(f"Keys: {', '.join(sorted(entries))}")
-    if "RESTIC_PASSWORD" in entries:
+        raise SystemExit(1)
+
+    prompted: dict[str, str] = {}
+    if stored:
+        env.update(stored)
+        print(
+            f"Credentials for {destination} are already configured "
+            f"({credentials.credentials_path()}) - skipping credential entry."
+        )
+    elif kind == "sftp":
+        # SFTP auth is SSH keys only; verify connectivity instead of prompting.
+        ok, stderr = _check_sftp_connectivity(destination, port)
+        if not ok:
+            _print_sftp_fix_commands(destination, port, stderr)
+            raise SystemExit(1)
+        print(f"SSH key authentication to {destination} verified.")
+    else:
+        prompted = _prompt_destination_credentials(destination)
+        env.update(prompted)
+
+    # Probe/init needs a repo password. When none is known for this
+    # destination (stored creds, restic.env, or process env), generate one for
+    # the new repository — an existing repo will simply fail to open and we
+    # ask for its password below.
+    password_generated = False
+    if not agent._has_repo_password(env):
+        env["RESTIC_PASSWORD"] = secrets.token_urlsafe(32)
+        password_generated = True
+
+    check = restic.check_repo(destination, env=env, port=port)
+    if check.exists is None and password_generated:
+        # A generated password cannot open an existing repository: ask for
+        # the existing repo's password and re-probe (attach-existing-repo path).
+        print(
+            f"Could not open a repository at {destination} with a fresh password. "
+            "If the repository already exists, enter its password."
+        )
+        env["RESTIC_PASSWORD"] = _prompt_password_twice()
+        password_generated = False
+        check = restic.check_repo(destination, env=env, port=port)
+    if check.exists is None:
+        message = (
+            check.stderr_tail or "Could not verify repository at destination."
+        ) + agent._auth_failure_hint(check.stderr_tail, job_id)
+        print(f"Error: could not verify the repository at {destination}: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    initialized_now = False
+    if check.exists is False:
+        try:
+            result = restic.init_repo(destination, env=env, port=port)
+        except FileNotFoundError:
+            print(
+                "Error: restic executable not found on PATH. Install restic and try again.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if result.exit_code != 0:
+            if _already_initialized(result.stderr_tail):
+                print(f"Repository at {destination} is already initialized.")
+            else:
+                message = (result.stderr_tail or "Failed to initialize repository.") + (
+                    agent._auth_failure_hint(result.stderr_tail, job_id)
+                )
+                print(f"Error: restic init failed: {message}", file=sys.stderr)
+                raise SystemExit(1)
+        else:
+            initialized_now = True
+
+    # Persist what this destination needs so future runs find it by fingerprint.
+    entries = dict(prompted)
+    if "RESTIC_PASSWORD" in env and (stored is None or "RESTIC_PASSWORD" not in stored):
+        entries["RESTIC_PASSWORD"] = env["RESTIC_PASSWORD"]
+    if entries:
+        try:
+            credentials.save_credentials(fingerprint, destination, entries)
+        except (OSError, credentials.CredentialsError) as exc:
+            print(
+                "Error: the repository is ready, but the credentials could not be saved to "
+                f"{credentials.credentials_path()}: {exc}. Add them there manually.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    if initialized_now and password_generated:
+        print()
+        print(f"Generated repository password: {env['RESTIC_PASSWORD']}")
         print(
             "WARNING: This password is stored only on this machine and cannot be recovered. "
             "Store it in a password manager now - losing it permanently locks your backups."
         )
+        _confirm_password_saved()
 
-
-def run_secret_list(_args: argparse.Namespace) -> None:
-    profiles = secret_store.list_profiles()
-    if not profiles:
-        print("No credential profiles configured. Use 'vecta-agent secret set <NAME>'.")
-        return
-    for name, keys in sorted(profiles.items()):
-        print(f"{name}: {', '.join(keys) if keys else '(empty)'}")
-
-
-def run_secret_remove(args: argparse.Namespace) -> None:
-    try:
-        existed = secret_store.remove_profile(args.profile)
-    except secret_store.SecretsError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-    if existed:
-        print(f"Profile '{args.profile}' removed.")
+    print()
+    if initialized_now:
+        print(f"Repository initialized at {destination}.")
     else:
-        print(f"Error: profile '{args.profile}' not found.", file=sys.stderr)
-        raise SystemExit(1)
+        print(f"Repository at {destination} is ready (already existed).")
+    print(f"Job {job_id} is configured and will run whenever its schedule next triggers.")
+
+
+# ---------------------------------------------------------------------------
 
 
 _ALREADY_INITIALIZED_MARKERS = ("already initialized", "already exists")
@@ -236,11 +399,6 @@ def main(argv: list[str] | None = None) -> None:
         "init", help="Initialize the restic repository at DESTINATION and set its password"
     )
     repo_init_parser.add_argument("destination", help="The restic repository location")
-    repo_init_parser.add_argument(
-        "--profile",
-        help="Store the repository password in secrets.toml under this profile name "
-        "instead of the global restic.env",
-    )
     password_group = repo_init_parser.add_mutually_exclusive_group()
     password_group.add_argument(
         "--password",
@@ -254,42 +412,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     repo_init_parser.set_defaults(func=run_repo_init)
 
-    secret_parser = subparsers.add_parser(
-        "secret", help="Manage local credential profiles (secrets never leave this machine)"
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Configure credentials for a job's destination and initialize its repository",
     )
-    secret_sub = secret_parser.add_subparsers(dest="secret_command", required=True)
-
-    secret_set_parser = secret_sub.add_parser(
-        "set", help="Create or update a credential profile referenced by jobs"
-    )
-    secret_set_parser.add_argument(
-        "profile", help="Profile name (matches the job's credential_profile)"
-    )
-    secret_set_parser.add_argument(
-        "--env",
-        action="append",
-        metavar="KEY=VALUE",
-        help="Additional secret env var for restic (e.g. AWS_ACCESS_KEY_ID=...), repeatable",
-    )
-    secret_password_group = secret_set_parser.add_mutually_exclusive_group()
-    secret_password_group.add_argument(
-        "--password",
-        help="Repository password (avoid: visible in shell history; prefer the prompt or --generate)",
-    )
-    secret_password_group.add_argument(
-        "--password-file", help="Read the repository password from a file"
-    )
-    secret_password_group.add_argument(
-        "--generate", action="store_true", help="Generate a strong random password"
-    )
-    secret_set_parser.set_defaults(func=run_secret_set)
-
-    secret_sub.add_parser("list", help="List profile names and their keys (never values)").set_defaults(
-        func=run_secret_list
-    )
-    secret_remove_parser = secret_sub.add_parser("remove", help="Delete a credential profile")
-    secret_remove_parser.add_argument("profile", help="Profile name to remove")
-    secret_remove_parser.set_defaults(func=run_secret_remove)
+    setup_parser.add_argument("job_id", help="The job ID from the Vecta dashboard")
+    setup_parser.set_defaults(func=run_setup)
 
     version_parser = subparsers.add_parser("version", help="Show version")
     version_parser.set_defaults(func=run_version)
@@ -318,7 +446,7 @@ def main(argv: list[str] | None = None) -> None:
     except config.ConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
-    except secret_store.SecretsError as exc:
+    except credentials.CredentialsError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     except api.AgentDeactivatedError as exc:

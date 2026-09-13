@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -11,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("vecta_agent")
 
 
 @dataclass
@@ -127,13 +130,29 @@ class ResticRunner:
 def repo_options(destination: str, port: int | None) -> list[str]:
     """Extended restic options for a destination.
 
-    SFTP with a non-default port: `-o sftp.args="-p <port>"` sets the arguments
-    passed to the default SSH command (restic docs, SFTP backend). Ignored for
-    non-sftp destinations — their locations carry ports in their URL syntax.
+    SFTP with a non-default port: restic's `sftp.command` option replaces the
+    default ssh invocation ENTIRELY and restic does not append the sftp
+    subsystem for it, so the command must carry `-s sftp` itself (restic
+    sftp.go buildSSHCommand; no %h/%r placeholders exist). Only the legacy
+    `sftp:user@host:/path` format is overridden — with the
+    `sftp://user@host:port/path` URL format restic reads the port from the URL
+    and needs no override. Ignored for non-sftp destinations — their locations
+    carry ports in their URL syntax.
     """
-    if port is not None and destination.startswith("sftp:"):
-        return ["-o", f"sftp.args=-p {port}"]
-    return []
+    if port is None or not destination.startswith("sftp:"):
+        return []
+    if destination.startswith("sftp://"):
+        return []
+    connection = destination[len("sftp:"):].split(":", 1)[0]
+    if not connection:
+        logger.warning(
+            "Could not parse the SFTP destination %r; ignoring SSH port %s. "
+            "Use the sftp:user@host:/path format.",
+            destination,
+            port,
+        )
+        return []
+    return ["-o", f"sftp.command=ssh -p {port} {connection} -s sftp"]
 
 
 def run_restic(args: list[str], env: dict[str, str] | None = None) -> ResticResult:

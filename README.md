@@ -16,12 +16,16 @@ Stateless backup agent for the [Vecta](https://vectaapp.com) platform. Runs on L
 # 1. Register this machine (one-time)
 vecta-agent register --token <REGISTRATION_TOKEN>
 
-# 2. Initialize the backup repository (one-time, per destination)
-vecta-agent repo init <DESTINATION> --generate
+# 2. Create a job in the Vecta dashboard, then run once on this machine:
+vecta-agent setup <JOB_ID>
 
 # 3. Run backups (single pass; call from cron)
 vecta-agent run
 ```
+
+`setup` fetches the job's non-secret config from the backend, stores the destination
+credentials locally (hidden prompts), initializes the restic repository, and prints a
+generated repository password once.
 
 ## Installation
 
@@ -57,11 +61,8 @@ pip install -e .
 | Command | Description |
 |---------|-------------|
 | `vecta-agent register --token <TOKEN>` | Register this machine with Vecta |
-| `vecta-agent repo init <DEST>` | Initialize a restic repository at destination |
-| `vecta-agent repo init <DEST> --profile <NAME>` | Init and store the password in credential profile `<NAME>` |
-| `vecta-agent secret set <NAME>` | Create/update a local credential profile (`--generate`, `--password`, `--password-file`, `--env KEY=VALUE`) |
-| `vecta-agent secret list` | List profile names and their keys (never values) |
-| `vecta-agent secret remove <NAME>` | Delete a credential profile |
+| `vecta-agent setup <JOB_ID>` | Store credentials for a job's destination and initialize its repository |
+| `vecta-agent repo init <DEST>` | Initialize a restic repository at destination (manual escape hatch) |
 | `vecta-agent run` | Execute due backup jobs (single pass) |
 | `vecta-agent version` | Show version |
 | `vecta-agent update` | Update the installed binary to the latest GitHub release (`--check` to compare only, `--version vX.Y.Z` to pin) |
@@ -69,9 +70,10 @@ pip install -e .
 ### Repository initialization
 
 ```bash
-vecta-agent repo init <DESTINATION>                 # prompts for password
-vecta-agent repo init <DESTINATION> --generate      # generates random password
-vecta-agent repo init <DESTINATION> --password <P>  # password on command line
+vecta-agent setup <JOB_ID>                           # recommended: credentials + repo init
+vecta-agent repo init <DESTINATION>                  # prompts for password
+vecta-agent repo init <DESTINATION> --generate       # generates random password
+vecta-agent repo init <DESTINATION> --password <P>   # password on command line
 vecta-agent repo init <DESTINATION> --password-file <F>  # password from file
 ```
 
@@ -84,8 +86,8 @@ Files are stored in `~/.config/vecta/`:
 | File | Contents | Permissions |
 |------|----------|-------------|
 | `config.toml` | `agent_id`, `api_key`, `name` | `chmod 600` |
-| `restic.env` | Global `RESTIC_PASSWORD` and cloud credentials (fallback for jobs without a profile) | `chmod 600` |
-| `secrets.toml` | Credential profiles — one `[profile-name]` section per destination, referenced by a job's `credential_profile` | `chmod 600` |
+| `restic.env` | Global `RESTIC_PASSWORD` and cloud credentials (fallback for destinations without stored credentials) | `chmod 600` |
+| `credentials.toml` | Per-destination credentials, one `[<fingerprint>]` section per destination | `chmod 600` |
 
 ### restic.env
 
@@ -95,23 +97,24 @@ AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
 ```
 
-### secrets.toml (credential profiles)
+### credentials.toml (per-destination credentials)
 
-Jobs reference secrets by profile name only — values never reach the backend:
+Credentials are keyed by a fingerprint of the destination (a hash of the destination
+string), never by a user-chosen name — two jobs to the same destination automatically
+share one credential set:
 
 ```toml
-[prod-s3]
+[a1b2c3d4e5f60718]
+destination = "s3:https://<account>.r2.cloudflarestorage.com/<bucket>"
 RESTIC_PASSWORD=...
 AWS_ACCESS_KEY_ID=...
 AWS_SECRET_ACCESS_KEY=...
-
-[nas-sftp]
-RESTIC_PASSWORD=...
 ```
 
-Per-job env resolution: process env → `restic.env` → the job's profile (profile wins). Each
-destination can have its own repository password. SFTP destinations use SSH keys; a job's
-`port` field is passed to restic as `-o sftp.args="-p <port>"`.
+Per-job env resolution: process env → `restic.env` → the destination's stored
+credentials (stored wins). Each destination has its own repository password. SFTP
+destinations authenticate with SSH keys (no secrets are stored for them); a job's
+`port` field is passed to restic via `-o sftp.command="ssh -p <port> <user>@<host> -s sftp"`.
 
 **Important:** The repository password is the encryption key for your backups. It is **never** stored on the Vecta backend and **cannot be recovered**. Store it in a password manager.
 

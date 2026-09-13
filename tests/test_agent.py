@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from vecta_agent import agent, api, config, restic, secrets
+from vecta_agent import agent, api, config, credentials, restic
 
 
 class FakeApiClient:
@@ -250,7 +250,7 @@ class TestRunAgent:
         failure = fake.status_reports[-1]
         assert failure["status"] == "failed"
         assert failure["exit_code"] == 1
-        assert "repo init" in failure["message"]
+        assert "vecta-agent setup j5" in failure["message"]
 
     def test_repo_missing_auto_inits_then_backs_up(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
@@ -418,21 +418,19 @@ class TestRunAgent:
         assert "restic binary not found in PATH" in failure["message"]
 
 
-class TestCredentialProfiles:
-    def test_profile_env_merged_and_overrides_global(self, tmp_config_dir, monkeypatch):
+class TestDestinationCredentials:
+    def _save_for(self, destination, entries):
+        credentials.save_credentials(
+            credentials.destination_fingerprint(destination), destination, entries
+        )
+
+    def test_stored_creds_merged_and_override_global(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)  # restic.env: RESTIC_PASSWORD=test
-        secrets.save_profile("prod-s3", {
-            "RESTIC_PASSWORD": "profile-secret",
-            "AWS_ACCESS_KEY_ID": "AKIA",
-        })
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._save_for(dest, {"RESTIC_PASSWORD": "dest-secret", "AWS_ACCESS_KEY_ID": "AKIA"})
 
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
-        fake.jobs = [{
-            "job_id": "j1",
-            "source": "/src",
-            "destination": "/dest",
-            "credential_profile": "prod-s3",
-        }]
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": dest}]
 
         captured_env = {}
 
@@ -450,25 +448,74 @@ class TestCredentialProfiles:
 
         agent.run_agent()
 
-        assert captured_env["RESTIC_PASSWORD"] == "profile-secret"
+        assert captured_env["RESTIC_PASSWORD"] == "dest-secret"
         assert captured_env["AWS_ACCESS_KEY_ID"] == "AKIA"
         assert fake.status_reports[-1]["status"] == "success"
 
-    def test_missing_profile_reports_failed(self, tmp_config_dir, monkeypatch):
+    def test_other_destinations_creds_not_applied(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        self._save_for(
+            "s3:https://other.example.com/bucket", {"RESTIC_PASSWORD": "other-secret"}
+        )
+
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
+
+        captured_env = {}
+
+        def fake_runner(source, destination, port=None, env=None):
+            captured_env.update(env or {})
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {"message_type": "summary", "snapshot_id": "s1"}
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert captured_env["RESTIC_PASSWORD"] == "test"  # global, untouched
+
+    def test_global_restic_env_still_works_without_stored_creds(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
-        fake.jobs = [{
-            "job_id": "j1",
-            "source": "/src",
-            "destination": "/dest",
-            "credential_profile": "prod-s3",
-        }]
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
+
+        captured_env = {}
+
+        def fake_runner(source, destination, port=None, env=None):
+            captured_env.update(env or {})
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {"message_type": "summary", "snapshot_id": "s1"}
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert captured_env["RESTIC_PASSWORD"] == "test"
+        assert fake.status_reports[-1]["status"] == "success"
+
+    def test_malformed_credentials_file_reports_failed(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        path = credentials.credentials_path()
+        path.write_text(f"[{credentials.destination_fingerprint(dest)}]\nCOUNT = 3\n", encoding="utf-8")
+
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": dest}]
         runner_called = []
 
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
         monkeypatch.setattr(
-            agent.restic, "ResticRunner",
-            lambda *a, **kw: runner_called.append(a),
+            agent.restic, "ResticRunner", lambda *a, **kw: runner_called.append(a)
         )
 
         agent.run_agent()
@@ -476,65 +523,87 @@ class TestCredentialProfiles:
         assert runner_called == []
         failure = fake.status_reports[-1]
         assert failure["status"] == "failed"
-        assert failure["exit_code"] == 1
-        assert "prod-s3" in failure["message"]
-        assert "vecta-agent secret set prod-s3" in failure["message"]
+        assert "Invalid local credentials file" in failure["message"]
 
-    def test_missing_profile_password_hint(self, tmp_config_dir, monkeypatch):
+    def test_no_stored_creds_does_not_fail_before_restic(self, tmp_config_dir, monkeypatch):
+        # Destinations needing nothing stored (global env, instance roles, SSH
+        # keys) must run: no pre-check may gate on stored credentials.
         make_config(tmp_config_dir)
-        (tmp_config_dir / "restic.env").write_text("AWS_ACCESS_KEY_ID=AKIA\n")
-        secrets.save_profile("prod-s3", {"AWS_ACCESS_KEY_ID": "AKIA"})
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
-        fake.jobs = [{
-            "job_id": "j1",
-            "source": "/src",
-            "destination": "/dest",
-            "credential_profile": "prod-s3",
-        }]
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
+        runner_called = []
+
+        def fake_runner(source, destination, port=None, env=None):
+            runner_called.append((source, destination))
+            r = FakeRunner(source, destination, port, env)
+            r.summary = {"message_type": "summary", "snapshot_id": "s1"}
+            return r
 
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
-        monkeypatch.setattr(
-            agent.restic, "ResticRunner",
-            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")),
-        )
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert runner_called
+        assert fake.status_reports[-1]["status"] == "success"
+
+    def test_auth_failure_appends_setup_hint(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": dest}]
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.exit_code = 1
+            r.stderr = "AccessDenied: The AWS Access Key Id you provided does not exist"
+            return r
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
 
         agent.run_agent()
 
         failure = fake.status_reports[-1]
         assert failure["status"] == "failed"
-        assert "secret set prod-s3" in failure["message"]
+        assert "AccessDenied" in failure["message"]
+        assert "vecta-agent setup j1" in failure["message"]
 
-    def test_invalid_profile_reports_failed(self, tmp_config_dir, monkeypatch):
+    def test_non_auth_failure_has_no_hint(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
-        path = secrets.secrets_path()
-        path.write_text("[prod-s3]\nCOUNT = 3\n", encoding="utf-8")
-
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
-        fake.jobs = [{
-            "job_id": "j1",
-            "source": "/src",
-            "destination": "/dest",
-            "credential_profile": "prod-s3",
-        }]
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
+
+        def fake_runner(source, destination, port=None, env=None):
+            r = FakeRunner(source, destination, port, env)
+            r.exit_code = 1
+            r.stderr = "no space left on device"
+            return r
 
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        patch_repo(monkeypatch)
+        monkeypatch.setattr(agent.restic, "ResticRunner", fake_runner)
+        monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
 
         agent.run_agent()
 
         failure = fake.status_reports[-1]
-        assert failure["status"] == "failed"
-        assert "Invalid credential profile" in failure["message"]
+        assert "no space left on device" in failure["message"]
+        assert "vecta-agent setup" not in failure["message"]
 
-    def test_profile_used_for_repo_probe_and_init(self, tmp_config_dir, monkeypatch):
+    def test_stored_creds_used_for_repo_probe_and_init(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
-        secrets.save_profile("prod-s3", {"RESTIC_PASSWORD": "profile-secret"})
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._save_for(dest, {"RESTIC_PASSWORD": "dest-secret"})
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
-        fake.jobs = [{
-            "job_id": "j1",
-            "source": "/src",
-            "destination": "/dest",
-            "credential_profile": "prod-s3",
-        }]
+        fake.jobs = [{"job_id": "j1", "source": "/src", "destination": dest}]
 
         probe_env = {}
         init_env = {}
@@ -559,8 +628,8 @@ class TestCredentialProfiles:
 
         agent.run_agent()
 
-        assert probe_env["RESTIC_PASSWORD"] == "profile-secret"
-        assert init_env["RESTIC_PASSWORD"] == "profile-secret"
+        assert probe_env["RESTIC_PASSWORD"] == "dest-secret"
+        assert init_env["RESTIC_PASSWORD"] == "dest-secret"
 
 
 class TestJobLock:

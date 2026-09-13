@@ -1,6 +1,20 @@
 import pytest
 
-from vecta_agent import __version__, api, cli, config, restic, secrets
+from vecta_agent import __version__, api, cli, config, credentials, restic
+
+
+class FakeSetupClient:
+    """Fake ApiClient for `setup` tests: serves one job config."""
+
+    def __init__(self, job=None):
+        self.job = job if job is not None else {
+            "job_id": "j1", "source": "/src", "destination": "/dest",
+        }
+        self.get_job_calls: list[str] = []
+
+    def get_job(self, job_id):
+        self.get_job_calls.append(job_id)
+        return self.job
 
 
 class TestCli:
@@ -204,138 +218,275 @@ class TestCli:
         assert exc.value.code == 0
 
 
-class TestSecretSet:
-    def test_set_with_password(self, tmp_config_dir, capsys):
-        cli.main(["secret", "set", "prod-s3", "--password", "s3cret"])
+class TestSetup:
+    def _install_client(self, monkeypatch, job):
+        fake = FakeSetupClient(job)
+        monkeypatch.setattr(cli.api, "ApiClient", lambda *a, **kw: fake)
+        return fake
 
-        out = capsys.readouterr().out
-        assert "Profile 'prod-s3' saved" in out
-        assert "cannot be recovered" in out
-        assert secrets.load_profile("prod-s3") == {"RESTIC_PASSWORD": "s3cret"}
+    @staticmethod
+    def _capture_input(monkeypatch, answers):
+        """Replace builtins.input, recording the prompts it is shown."""
+        answers = iter(answers)
+        prompts = []
 
-    def test_set_with_generate(self, tmp_config_dir, capsys):
-        cli.main(["secret", "set", "p", "--generate"])
-        profile = secrets.load_profile("p")
-        assert profile["RESTIC_PASSWORD"]
-        assert "Generated repository password:" in capsys.readouterr().out
+        def fake_input(prompt=""):
+            prompts.append(prompt)
+            return next(answers)
 
-    def test_set_with_env_only(self, tmp_config_dir, capsys):
-        cli.main(["secret", "set", "r2", "--env", "AWS_ACCESS_KEY_ID=AKIA",
-                  "--env", "AWS_SECRET_ACCESS_KEY=topsecret"])
-        assert secrets.load_profile("r2") == {
-            "AWS_ACCESS_KEY_ID": "AKIA",
-            "AWS_SECRET_ACCESS_KEY": "topsecret",
-        }
-        out = capsys.readouterr().out
-        assert "Keys: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY" in out
+        monkeypatch.setattr("builtins.input", fake_input)
+        return prompts
 
-    def test_set_merges_keys_across_calls(self, tmp_config_dir):
-        cli.main(["secret", "set", "r2", "--password", "pw"])
-        cli.main(["secret", "set", "r2", "--env", "AWS_ACCESS_KEY_ID=AKIA"])
-        assert secrets.load_profile("r2") == {
-            "RESTIC_PASSWORD": "pw",
-            "AWS_ACCESS_KEY_ID": "AKIA",
-        }
+    def test_fresh_s3_prompts_inits_and_gates(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
 
-    def test_set_password_and_env(self, tmp_config_dir):
-        cli.main(["secret", "set", "r2", "--password", "pw",
-                  "--env", "AWS_SECRET_ACCESS_KEY=k"])
-        assert secrets.load_profile("r2") == {
-            "RESTIC_PASSWORD": "pw",
-            "AWS_SECRET_ACCESS_KEY": "k",
-        }
+        answers = iter(["access-key-id", "secret-key"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **kw: next(answers))
+        init_env = {}
+        monkeypatch.setattr(
+            cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False)
+        )
 
-    def test_set_invalid_env_pair(self, tmp_config_dir, capsys):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(["secret", "set", "r2", "--env", "NOVALUE"])
-        assert exc.value.code == 1
-        assert "KEY=VALUE" in capsys.readouterr().err
-
-    def test_set_invalid_name(self, tmp_config_dir):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(["secret", "set", "Bad Name", "--password", "pw"])
-        assert exc.value.code == 1
-
-    def test_set_empty_password_rejected(self, tmp_config_dir):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(["secret", "set", "r2", "--password", ""])
-        assert exc.value.code == 1
-        assert secrets.list_profiles() == {}
-
-    def test_set_before_register_creates_config_dir(self, tmp_path, monkeypatch):
-        nested = tmp_path / "not" / "yet" / "created"
-        monkeypatch.setenv("VECTA_CONFIG_DIR", str(nested))
-        cli.main(["secret", "set", "r2", "--password", "pw"])
-        assert (nested / "secrets.toml").exists()
-
-
-class TestSecretList:
-    def test_list_profiles(self, tmp_config_dir, capsys):
-        secrets.save_profile("r2", {"AWS_ACCESS_KEY_ID": "x", "RESTIC_PASSWORD": "y"})
-        secrets.save_profile("prod", {"RESTIC_PASSWORD": "z"})
-        cli.main(["secret", "list"])
-        out = capsys.readouterr().out
-        assert "r2: AWS_ACCESS_KEY_ID, RESTIC_PASSWORD" in out
-        assert "prod: RESTIC_PASSWORD" in out
-        assert "x" not in out.split("r2:")[1].splitlines()[0]
-
-    def test_list_empty(self, tmp_config_dir, capsys):
-        cli.main(["secret", "list"])
-        assert "No credential profiles" in capsys.readouterr().out
-
-
-class TestSecretRemove:
-    def test_remove_existing(self, tmp_config_dir, capsys):
-        secrets.save_profile("p", {"K": "v"})
-        cli.main(["secret", "remove", "p"])
-        assert "removed" in capsys.readouterr().out
-        assert secrets.list_profiles() == {}
-
-    def test_remove_missing(self, tmp_config_dir, capsys):
-        with pytest.raises(SystemExit) as exc:
-            cli.main(["secret", "remove", "nope"])
-        assert exc.value.code == 1
-        assert "not found" in capsys.readouterr().err
-
-
-class TestRepoInitProfile:
-    def test_init_profile_saves_to_secrets(self, tmp_config_dir, monkeypatch, capsys):
-        monkeypatch.setattr(cli.restic, "init_repo", lambda *a, **kw: restic.ResticResult(exit_code=0))
-        cli.main(["repo", "init", "sftp:user@host:/path", "--profile", "prod-sftp",
-                  "--password", "pw"])
-
-        env_path = tmp_config_dir / "restic.env"
-        assert not env_path.exists()
-        assert secrets.load_profile("prod-sftp") == {"RESTIC_PASSWORD": "pw"}
-        assert "profile 'prod-sftp'" in capsys.readouterr().out
-
-    def test_init_profile_merges_profile_env_for_init(self, tmp_config_dir, monkeypatch):
-        secrets.save_profile("prod-sftp", {"AWS_ACCESS_KEY_ID": "AKIA"})
-        captured = {}
-
-        def fake_init(destination, env=None):
-            captured.update(env or {})
+        def fake_init(destination, env=None, port=None):
+            init_env.update(env or {})
             return restic.ResticResult(exit_code=0)
 
         monkeypatch.setattr(cli.restic, "init_repo", fake_init)
-        cli.main(["repo", "init", "s3:bucket", "--profile", "prod-sftp", "--password", "pw"])
-        assert captured["AWS_ACCESS_KEY_ID"] == "AKIA"
-        assert captured["RESTIC_PASSWORD"] == "pw"
-        assert secrets.load_profile("prod-sftp")["RESTIC_PASSWORD"] == "pw"
+        prompts = self._capture_input(monkeypatch, ["SAVED"])
 
-    def test_init_profile_already_initialized(self, tmp_config_dir, monkeypatch, capsys):
+        cli.main(["setup", "j1"])
+
+        out = capsys.readouterr().out
+        assert "Generated repository password:" in out
+        assert "cannot be recovered" in out
+        assert "already configured" not in out
+        assert init_env["AWS_ACCESS_KEY_ID"] == "access-key-id"
+        assert init_env["AWS_SECRET_ACCESS_KEY"] == "secret-key"
+
+        saved = credentials.load_credentials(
+            credentials.destination_fingerprint(dest)
+        )
+        assert saved["AWS_ACCESS_KEY_ID"] == "access-key-id"
+        assert saved["AWS_SECRET_ACCESS_KEY"] == "secret-key"
+        assert saved["RESTIC_PASSWORD"]
+        assert "Type SAVED" in prompts[0]
+
+    def test_gate_blocks_until_saved(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "/backups/data"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        prompts = self._capture_input(monkeypatch, ["no", "still no", "SAVED"])
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
+        monkeypatch.setattr(
+            cli.restic, "init_repo", lambda *a, **kw: restic.ResticResult(exit_code=0)
+        )
+
+        cli.main(["setup", "j1"])
+
+        out = capsys.readouterr().out
+        assert len(prompts) == 3
+        assert all("Type SAVED" in p for p in prompts)
+        assert credentials.load_credentials(credentials.destination_fingerprint(dest))
+
+    def test_stored_credentials_skip_prompts(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+        credentials.save_credentials(
+            credentials.destination_fingerprint(dest),
+            dest,
+            {"RESTIC_PASSWORD": "stored-pw", "AWS_ACCESS_KEY_ID": "AKIA"},
+        )
+
+        def no_prompt(*a, **kw):
+            raise AssertionError("setup must not prompt when credentials are stored")
+
+        monkeypatch.setattr(cli.getpass, "getpass", no_prompt)
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))
         monkeypatch.setattr(
             cli.restic,
             "init_repo",
-            lambda *a, **kw: restic.ResticResult(
-                exit_code=1, stderr_tail="repository master key and config already initialized"
-            ),
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no init expected")),
         )
-        cli.main(["repo", "init", "/dest", "--profile", "p", "--password", "pw"])
+
+        cli.main(["setup", "j1"])
+
         out = capsys.readouterr().out
-        assert "already initialized" in out
-        assert "secret set p" in out
-        assert secrets.list_profiles() == {}
+        assert "already configured" in out
+        assert "Repository at" in out and "already existed" in out
+
+    def test_repo_exists_skips_init_and_saves_global_password(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        (tmp_config_dir / "restic.env").write_text("RESTIC_PASSWORD=test\n")
+        dest = "/backups/data"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        probe_env = {}
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))
+        monkeypatch.setattr(
+            cli.restic,
+            "init_repo",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no init expected")),
+        )
+
+        cli.main(["setup", "j1"])
+
+        saved = credentials.load_credentials(credentials.destination_fingerprint(dest))
+        assert saved["RESTIC_PASSWORD"] == "test"
+        out = capsys.readouterr().out
+        assert "already existed" in out
+        assert "Type SAVED" not in out  # password was known, nothing generated
+
+    def test_init_failure_saves_nothing(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        answers = iter(["AKIA", "shhh"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **kw: next(answers))
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
+        monkeypatch.setattr(
+            cli.restic,
+            "init_repo",
+            lambda *a, **kw: restic.ResticResult(exit_code=1, stderr_tail="AccessDenied"),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "AccessDenied" in err
+        assert "vecta-agent setup j1" in err  # auth hint
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_existing_repo_with_unknown_password_prompts(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        (tmp_config_dir / "restic.env").write_text("")  # no global password
+        dest = "/backups/existing"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        probes = iter([restic.RepoCheck(None, "wrong password"), restic.RepoCheck(True)])
+        monkeypatch.setattr(
+            cli.restic, "check_repo", lambda *a, **kw: next(probes)
+        )
+        pw_answers = iter(["real-pw", "real-pw"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **kw: next(pw_answers))
+
+        cli.main(["setup", "j1"])
+
+        saved = credentials.load_credentials(credentials.destination_fingerprint(dest))
+        assert saved["RESTIC_PASSWORD"] == "real-pw"
+        out = capsys.readouterr().out
+        assert "already existed" in out
+
+    def test_sftp_connectivity_failure_prints_fix_commands(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp:ops@nas:/backups"
+        self._install_client(
+            monkeypatch,
+            {"job_id": "j1", "source": "/src", "destination": dest, "port": 2222},
+        )
+
+        class FakeProc:
+            returncode = 255
+            stderr = "Permission denied (publickey)."
+
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: FakeProc())
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "Permission denied" in err
+        assert "ssh-copy-id -p 2222 ops@nas" in err
+        assert "ssh -p 2222 ops@nas" in err
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_sftp_connectivity_ok_then_inits(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp:ops@nas:/backups"
+        self._install_client(
+            monkeypatch,
+            {"job_id": "j1", "source": "/src", "destination": dest, "port": 2222},
+        )
+
+        class FakeProc:
+            returncode = 0
+            stderr = ""
+
+        ssh_cmds = []
+        monkeypatch.setattr(
+            cli.subprocess, "run", lambda cmd, **kw: ssh_cmds.append(cmd) or FakeProc()
+        )
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
+        monkeypatch.setattr(
+            cli.restic, "init_repo", lambda *a, **kw: restic.ResticResult(exit_code=0)
+        )
+        monkeypatch.setattr("builtins.input", lambda *a, **kw: "SAVED")
+
+        cli.main(["setup", "j1"])
+
+        out = capsys.readouterr().out
+        assert "SSH key authentication" in out
+        assert "Generated repository password:" in out
+        assert ssh_cmds[0][0] == "ssh"
+        assert "-p" in ssh_cmds[0] and "2222" in ssh_cmds[0]
+        assert "ops@nas" in ssh_cmds[0]
+        saved = credentials.load_credentials(credentials.destination_fingerprint(dest))
+        assert saved["RESTIC_PASSWORD"]
+
+    def test_sftp_never_prompts_for_credentials(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "sftp:ops@nas:/backups"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        def no_prompt(*a, **kw):
+            raise AssertionError("SFTP setup must not prompt for credentials")
+
+        monkeypatch.setattr(cli.getpass, "getpass", no_prompt)
+
+        class FakeProc:
+            returncode = 0
+            stderr = ""
+
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: FakeProc())
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))
+
+        cli.main(["setup", "j1"])
+        assert "already existed" in capsys.readouterr().out
+
+    def test_job_fetch_failure_prints_message(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+
+        class FailingClient:
+            def get_job(self, job_id):
+                raise api.ApiError("Unexpected error 404 from http://test: Job not found")
+
+        monkeypatch.setattr(cli.api, "ApiClient", lambda *a, **kw: FailingClient())
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "nope"])
+        assert exc.value.code == 1
+        assert "Job not found" in capsys.readouterr().err
+
+    def test_malformed_credentials_file(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+        path = credentials.credentials_path()
+        path.write_text(
+            f'[{credentials.destination_fingerprint(dest)}]\nCOUNT = 3\n', encoding="utf-8"
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+        assert exc.value.code == 1
+        assert "must be a string" in capsys.readouterr().err
 
 
 def make_config(tmp_config_dir):

@@ -117,6 +117,26 @@ class TestApiClient:
         assert len(jobs) == 1
         assert jobs[0]["job_id"] == "j1"
 
+    def test_get_job(self, monkeypatch):
+        calls = []
+
+        def fake_request(method, url, headers=None, json=None):
+            calls.append((method, url, headers))
+            return _resp(
+                method,
+                url,
+                200,
+                {"job_id": "j1", "source": "/src", "destination": "/dest", "port": None},
+            )
+
+        monkeypatch.setattr(api.httpx, "Client", lambda **kw: _FakeClient(fake_request))
+        client = api.ApiClient("a1", "vc_k1", base_url="http://test/api")
+        job = client.get_job("j1")
+        assert job["job_id"] == "j1"
+        assert calls[0][0] == "GET"
+        assert calls[0][1].endswith("/agents/a1/jobs/j1")
+        assert calls[0][2]["Authorization"] == "Bearer vc_k1"
+
     def test_report_status(self, monkeypatch):
         calls = []
 

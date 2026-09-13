@@ -145,6 +145,18 @@ class ApiClient:
         data = response.json()
         return data.get("jobs", [])
 
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        """GET /agents/{id}/jobs/{job_id} — fetch one job's non-secret config on demand.
+
+        Unlike fetch_jobs, this returns the job regardless of whether it is
+        currently due to run (used by `vecta-agent setup`).
+        """
+        response = self._request_with_retry(
+            "GET", self._url(f"/agents/{self.agent_id}/jobs/{job_id}")
+        )
+        self._check_error(response)
+        return response.json()
+
     def report_status(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         """POST /agents/{id}/jobs/{job_id}/status."""
         response = self._request_with_retry(

@@ -11,12 +11,31 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vecta_agent import api, config, restic, secrets
+from vecta_agent import api, config, credentials, restic
 
 logger = logging.getLogger("vecta_agent")
 
 PROGRESS_INTERVAL_SECONDS = 10
 CANCEL_INTERVAL_SECONDS = 10
+
+# Substrings (case-insensitive) in restic's stderr that indicate an
+# authentication failure rather than e.g. a network problem. The hint is
+# appended to failure reports, so a false positive only adds advice.
+_AUTH_ERROR_MARKERS = (
+    "access denied",
+    "accessdenied",
+    "unauthorized",
+    "forbidden",
+    "auth",
+    "credentials",
+    "signature",
+    "invalidaccesskeyid",
+    "wrong password",
+    "passphrase",
+    "unable to open config file",
+    "permission denied",
+    "publickey",
+)
 
 
 try:
@@ -130,6 +149,20 @@ def _has_repo_password(restic_env: dict[str, str]) -> bool:
     )
 
 
+def _auth_failure_hint(stderr: str, job_id: str) -> str:
+    """Hint appended to failure reports when restic's stderr looks like an
+    authentication failure (missing/wrong stored credentials, SSH keys, ...).
+    """
+    low = stderr.lower()
+    if any(marker in low for marker in _AUTH_ERROR_MARKERS):
+        return (
+            " This looks like an authentication failure. Run "
+            f"'vecta-agent setup {job_id}' on this machine to configure the "
+            "credentials for this destination."
+        )
+    return ""
+
+
 def _progress_reporter(
     client: api.ApiClient,
     job_id: str,
@@ -192,51 +225,32 @@ def _resolve_job_env(
     job: dict[str, Any],
     restic_env: dict[str, str],
 ) -> dict[str, str] | None:
-    """Merge the global restic env with the job's credential profile.
+    """Merge the global restic env with the destination's stored credentials.
 
-    Returns None after reporting a failure when the profile is missing or the
-    secrets file is malformed.
+    Stored credentials (keyed by destination fingerprint) win over the global
+    env. Destinations that need nothing stored — global restic.env setups,
+    SFTP with SSH keys, cloud instance roles — run without them. Returns None
+    after reporting a failure when the credentials file is malformed.
     """
     job_env = dict(restic_env)
-    profile_name = job.get("credential_profile")
-    if not profile_name:
-        return job_env
-
     try:
-        profile = secrets.load_profile(profile_name)
-    except secrets.SecretsError as exc:
+        stored = credentials.load_credentials(
+            credentials.destination_fingerprint(job["destination"])
+        )
+    except credentials.CredentialsError as exc:
         client.report_status(
             job_id,
             {
                 "job_id": job_id,
                 "status": "failed",
                 "exit_code": 1,
-                "message": f"Invalid credential profile '{profile_name}': {exc}",
+                "message": f"Invalid local credentials file: {exc}",
             },
         )
-        logger.error("Job %s failed: invalid credential profile: %s", job_id, exc)
+        logger.error("Job %s failed: invalid local credentials file: %s", job_id, exc)
         return None
-    if profile is None:
-        client.report_status(
-            job_id,
-            {
-                "job_id": job_id,
-                "status": "failed",
-                "exit_code": 1,
-                "message": (
-                    f"Credential profile '{profile_name}' is not configured on this "
-                    f"machine. Run 'vecta-agent secret set {profile_name}' on this machine."
-                ),
-            },
-        )
-        logger.error(
-            "Job %s failed: credential profile '%s' not found in %s.",
-            job_id,
-            profile_name,
-            secrets.secrets_path(),
-        )
-        return None
-    job_env.update(profile)
+    if stored:
+        job_env.update(stored)
     return job_env
 
 
@@ -264,24 +278,17 @@ def _run_single_job(
             return
 
         if not _has_repo_password(job_env):
-            profile_name = job.get("credential_profile")
-            if profile_name:
-                hint = (
-                    f"Run 'vecta-agent secret set {profile_name}' on this machine "
-                    "to add RESTIC_PASSWORD to that profile."
-                )
-            else:
-                hint = (
-                    "Run 'vecta-agent repo init "
-                    f"{destination}' on this machine, or add RESTIC_PASSWORD to restic.env."
-                )
             client.report_status(
                 job_id,
                 {
                     "job_id": job_id,
                     "status": "failed",
                     "exit_code": 1,
-                    "message": f"No repository password configured. {hint}",
+                    "message": (
+                        "No repository password configured for this destination. "
+                        f"Run 'vecta-agent setup {job_id}' on this machine to "
+                        "configure it."
+                    ),
                 },
             )
             logger.error("Job %s failed: no repository password configured.", job_id)
@@ -299,8 +306,8 @@ def _run_single_job(
                             "job_id": job_id,
                             "status": "failed",
                             "exit_code": init_result.exit_code,
-                            "message": init_result.stderr_tail
-                            or "Failed to initialize repository.",
+"message": (init_result.stderr_tail or "Failed to initialize repository.")
+                    + _auth_failure_hint(init_result.stderr_tail, job_id),
                         },
                     )
                     logger.error(
@@ -318,8 +325,8 @@ def _run_single_job(
                         "job_id": job_id,
                         "status": "failed",
                         "exit_code": 1,
-                        "message": repo_check.stderr_tail
-                        or "Could not verify repository at destination.",
+                        "message": (repo_check.stderr_tail or "Could not verify repository at destination.")
+                        + _auth_failure_hint(repo_check.stderr_tail, job_id),
                     },
                 )
                 logger.error(
@@ -426,7 +433,8 @@ def _run_single_job(
                 "job_id": job_id,
                 "status": "failed",
                 "exit_code": exit_code,
-                "message": runner.stderr_tail() or f"restic exited with code {exit_code}",
+                "message": (runner.stderr_tail() or f"restic exited with code {exit_code}")
+                + _auth_failure_hint(runner.stderr_tail(), job_id),
                 "duration_seconds": duration,
             }
             client.report_status(job_id, payload)

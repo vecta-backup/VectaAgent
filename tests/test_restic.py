@@ -10,23 +10,45 @@ class FakeResult:
 class TestRepoOptions:
     def test_sftp_with_port(self):
         assert restic.repo_options("sftp:user@host:/path", 2222) == [
-            "-o", "sftp.args=-p 2222",
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp",
         ]
+
+    def test_sftp_with_port_keeps_sftp_subsystem(self):
+        # restic does not append `-s sftp` when sftp.command is set — verified
+        # against restic sftp.go buildSSHCommand.
+        opts = restic.repo_options("sftp:user@host:/path", 2222)
+        assert opts[1].endswith(" -s sftp")
 
     def test_sftp_without_port(self):
         assert restic.repo_options("sftp:user@host:/path", None) == []
+
+    def test_sftp_url_format_uses_url_port(self):
+        # sftp://user@host:port/path: restic reads the port from the URL.
+        assert restic.repo_options("sftp://user@host:2222/path", 2222) == []
+
+    def test_sftp_domain_confined_user(self):
+        assert restic.repo_options("sftp:user@domain@host:/path", 2222) == [
+            "-o", "sftp.command=ssh -p 2222 user@domain@host -s sftp",
+        ]
+
+    def test_malformed_sftp_port_is_loud(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            assert restic.repo_options("sftp::/path", 2222) == []
+        assert "Could not parse the SFTP destination" in caplog.text
 
     def test_non_sftp_port_ignored(self):
         assert restic.repo_options("/mnt/backups", 2222) == []
         assert restic.repo_options("s3:s3.amazonaws.com/bucket", 2222) == []
 
-    def test_backup_cmd_includes_sftp_args(self):
+    def test_backup_cmd_includes_sftp_command(self):
         runner = restic.ResticRunner("/src", "sftp:user@host:/path", port=2222)
         assert runner._build_cmd() == [
             "restic",
             "backup",
             "--json",
-            "-o", "sftp.args=-p 2222",
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp",
             "--repo",
             "sftp:user@host:/path",
             "/src",
@@ -42,7 +64,8 @@ class TestRepoOptions:
         monkeypatch.setattr(restic, "run_restic", fake_run_restic)
         restic.check_repo("sftp:user@host:/path", port=2222)
         assert calls[0] == [
-            "-o", "sftp.args=-p 2222", "cat", "config", "--repo", "sftp:user@host:/path",
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp",
+            "cat", "config", "--repo", "sftp:user@host:/path",
         ]
 
     def test_init_repo_uses_port(self, monkeypatch):
@@ -55,7 +78,8 @@ class TestRepoOptions:
         monkeypatch.setattr(restic, "run_restic", fake_run_restic)
         restic.init_repo("sftp:user@host:/path", port=2222)
         assert calls[0] == [
-            "-o", "sftp.args=-p 2222", "init", "--repo", "sftp:user@host:/path",
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp",
+            "init", "--repo", "sftp:user@host:/path",
         ]
 
 
