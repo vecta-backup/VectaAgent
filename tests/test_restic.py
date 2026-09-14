@@ -1,10 +1,13 @@
+import subprocess
+
 from vecta_agent import restic
 
 
 class FakeResult:
-    def __init__(self, exit_code, stderr_tail=""):
+    def __init__(self, exit_code, stderr_tail="", timed_out=False):
         self.exit_code = exit_code
         self.stderr_tail = stderr_tail
+        self.timed_out = timed_out
 
 
 class TestRepoOptions:
@@ -57,7 +60,7 @@ class TestRepoOptions:
     def test_check_repo_uses_port(self, monkeypatch):
         calls = []
 
-        def fake_run_restic(args, env=None):
+        def fake_run_restic(args, env=None, **kw):
             calls.append(args)
             return FakeResult(0)
 
@@ -71,7 +74,7 @@ class TestRepoOptions:
     def test_init_repo_uses_port(self, monkeypatch):
         calls = []
 
-        def fake_run_restic(args, env=None):
+        def fake_run_restic(args, env=None, **kw):
             calls.append(args)
             return FakeResult(0)
 
@@ -94,7 +97,8 @@ class TestRunRestic:
                 captured["args"] = args[0]
                 captured["env"] = kwargs["env"]
 
-            def communicate(self):
+            def communicate(self, timeout=None):
+                captured["timeout"] = timeout
                 return "out", "err"
 
         monkeypatch.setattr(restic.subprocess, "Popen", FakeProc)
@@ -103,6 +107,49 @@ class TestRunRestic:
         assert captured["env"]["K"] == "V"
         assert result.exit_code == 0
         assert result.stderr_tail == "err"
+        assert result.timed_out is False
+
+    def test_default_timeout_is_120(self, monkeypatch):
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def communicate(self, timeout=None):
+                captured["timeout"] = timeout
+                return "", ""
+
+        monkeypatch.setattr(restic.subprocess, "Popen", FakeProc)
+        restic.run_restic(["cat", "config", "--repo", "r"])
+        assert captured["timeout"] == restic.PROBE_TIMEOUT_SECONDS
+        assert restic.PROBE_TIMEOUT_SECONDS == 120
+
+    def test_timeout_kills_process_and_reports_124(self, monkeypatch):
+        killed = []
+
+        class HangingProc:
+            returncode = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def communicate(self, timeout=None):
+                if not killed:
+                    raise subprocess.TimeoutExpired(cmd="restic", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                killed.append(True)
+
+        monkeypatch.setattr(restic.subprocess, "Popen", HangingProc)
+        result = restic.run_restic(["cat", "config", "--repo", "r"], timeout_seconds=3)
+        assert killed == [True]
+        assert result.timed_out is True
+        assert result.exit_code == 124
+        assert "timed out after 3s" in result.stderr_tail
 
 
 class TestCheckRepo:
@@ -157,12 +204,34 @@ class TestCheckRepo:
         monkeypatch.setattr(restic, "run_restic", lambda *a, **kw: FakeResult(12, "wrong password"))
         assert restic.check_repo("r1").exists is None
 
+    def test_timeout_is_indeterminate_and_flagged(self, monkeypatch):
+        monkeypatch.setattr(
+            restic, "run_restic",
+            lambda *a, **kw: FakeResult(
+                124, "restic cat timed out after 120s and was killed", timed_out=True
+            ),
+        )
+        check = restic.check_repo("r1")
+        assert check.exists is None
+        assert check.timed_out is True
+
+    def test_passes_default_timeout(self, monkeypatch):
+        captured = {}
+
+        def fake_run_restic(args, env=None, **kw):
+            captured.update(kw)
+            return FakeResult(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run_restic)
+        restic.check_repo("r1")
+        assert captured["timeout_seconds"] == restic.PROBE_TIMEOUT_SECONDS
+
 
 class TestInitRepo:
     def test_init_command(self, monkeypatch):
         calls = []
 
-        def fake_run_restic(args, env=None):
+        def fake_run_restic(args, env=None, **kw):
             calls.append((args, env))
             return FakeResult(0)
 

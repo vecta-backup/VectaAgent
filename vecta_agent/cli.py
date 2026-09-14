@@ -114,6 +114,14 @@ def run_repo_init(args: argparse.Namespace) -> None:
             "restic.env to that repository's password."
         )
         return
+    if result.timed_out:
+        print(
+            "Error: repository initialization timed out after "
+            f"{restic.PROBE_TIMEOUT_SECONDS}s. Check your network connection and "
+            "destination credentials.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     print(f"Error: restic init failed: {result.stderr_tail}", file=sys.stderr)
     raise SystemExit(1)
 
@@ -346,6 +354,14 @@ def run_setup(args: argparse.Namespace) -> None:
         password_generated = False
         check = restic.check_repo(destination, env=env, port=port)
     if check.exists is None:
+        if check.timed_out:
+            print(
+                f"Error: could not verify the repository at {destination}: timed out "
+                f"after {restic.PROBE_TIMEOUT_SECONDS}s. Check your network connection "
+                "and destination credentials.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         message = (
             check.stderr_tail or "Could not verify repository at destination."
         ) + agent._auth_failure_hint(check.stderr_tail, job_id)
@@ -365,6 +381,14 @@ def run_setup(args: argparse.Namespace) -> None:
         if result.exit_code != 0:
             if _already_initialized(result.stderr_tail):
                 print(f"Repository at {destination} is already initialized.")
+            elif result.timed_out:
+                print(
+                    "Error: repository initialization timed out after "
+                    f"{restic.PROBE_TIMEOUT_SECONDS}s. Check your network connection "
+                    "and destination credentials.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
             else:
                 message = (result.stderr_tail or "Failed to initialize repository.") + (
                     agent._auth_failure_hint(result.stderr_tail, job_id)

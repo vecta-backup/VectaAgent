@@ -15,6 +15,14 @@ from typing import Any
 
 logger = logging.getLogger("vecta_agent")
 
+# Hard cap on one-shot restic commands: the repository-existence probe
+# (`cat config`) and `init`. Both read or create a single small file, so they
+# finish in seconds on a reachable destination; anything longer means the
+# connection is hung (e.g. a firewall silently dropping packets) and the
+# command would otherwise block the agent pass indefinitely. Not
+# user-configurable, like the 12h backup cap in agent.py.
+PROBE_TIMEOUT_SECONDS = 120
+
 
 @dataclass
 class ResticResult:
@@ -24,6 +32,10 @@ class ResticResult:
     bytes_processed: int | None = None
     transferred_bytes: int | None = None
     stderr_tail: str = ""
+    # True when the command was killed after `timeout_seconds` rather than
+    # finishing on its own; exit_code is then always 124 (the agent's
+    # timeout convention, matching the backup watchdog).
+    timed_out: bool = False
 
 
 class ResticRunner:
@@ -155,8 +167,17 @@ def repo_options(destination: str, port: int | None) -> list[str]:
     return ["-o", f"sftp.command=ssh -p {port} {connection} -s sftp"]
 
 
-def run_restic(args: list[str], env: dict[str, str] | None = None) -> ResticResult:
-    """Run a one-shot restic command and capture exit code + stderr tail."""
+def run_restic(
+    args: list[str],
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
+) -> ResticResult:
+    """Run a one-shot restic command and capture exit code + stderr tail.
+
+    Bounded by `timeout_seconds`: on expiry the process is killed (no grace
+    period — a one-shot command past its deadline is already hung) and the
+    result carries `timed_out=True` with exit code 124.
+    """
     full_env = {**os.environ, **(env or {})}
     proc = subprocess.Popen(
         ["restic", *args],
@@ -165,7 +186,16 @@ def run_restic(args: list[str], env: dict[str, str] | None = None) -> ResticResu
         text=True,
         env=full_env,
     )
-    stdout, stderr = proc.communicate()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()  # reap the killed process
+        return ResticResult(
+            exit_code=124,
+            stderr_tail=f"restic {args[0]} timed out after {timeout_seconds}s and was killed",
+            timed_out=True,
+        )
     return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
 
 
@@ -175,11 +205,21 @@ class RepoCheck:
     `exists` is True when the repo is present, False when restic reports it
     definitively missing, and None when the check is inconclusive (e.g. the
     storage backend is unreachable or the password is wrong).
+
+    `timed_out` is True when the probe was killed by the timeout instead of
+    finishing with a restic verdict — `exists` is then None, but the caller
+    should report a network-timeout failure rather than suggesting setup.
     """
 
-    def __init__(self, exists: bool | None, stderr_tail: str = "") -> None:
+    def __init__(
+        self,
+        exists: bool | None,
+        stderr_tail: str = "",
+        timed_out: bool = False,
+    ) -> None:
         self.exists = exists
         self.stderr_tail = stderr_tail
+        self.timed_out = timed_out
 
 
 def _looks_missing(stderr: str) -> bool:
@@ -198,16 +238,24 @@ def _looks_missing(stderr: str) -> bool:
 
 
 def check_repo(
-    destination: str, env: dict[str, str] | None = None, port: int | None = None
+    destination: str,
+    env: dict[str, str] | None = None,
+    port: int | None = None,
+    timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
 ) -> RepoCheck:
     """Probe whether a restic repository exists at `destination`.
 
     Uses `restic cat config`, whose exit code since restic 0.17 is 0 when the
     repo exists and 10 when it definitively does not. Any other exit code means
     the check is inconclusive and the caller must NOT initialize.
+
+    Bounded by `timeout_seconds`: a probe that outlives it (a hung connection,
+    not a restic verdict) returns `exists=None, timed_out=True`.
     """
     args = [*repo_options(destination, port), "cat", "config", "--repo", destination]
-    result = run_restic(args, env=env)
+    result = run_restic(args, env=env, timeout_seconds=timeout_seconds)
+    if result.timed_out:
+        return RepoCheck(None, result.stderr_tail, timed_out=True)
     if result.exit_code == 0:
         return RepoCheck(True)
     if result.exit_code == 10:
@@ -218,11 +266,14 @@ def check_repo(
 
 
 def init_repo(
-    destination: str, env: dict[str, str] | None = None, port: int | None = None
+    destination: str,
+    env: dict[str, str] | None = None,
+    port: int | None = None,
+    timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
 ) -> ResticResult:
     """Initialize a new restic repository at `destination`."""
     args = [*repo_options(destination, port), "init", "--repo", destination]
-    return run_restic(args, env=env)
+    return run_restic(args, env=env, timeout_seconds=timeout_seconds)
 
 
 def parse_summary(obj: dict[str, Any]) -> dict[str, Any]:

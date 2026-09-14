@@ -461,6 +461,60 @@ class TestRunAgent:
         assert failure["status"] == "failed"
         assert "connection refused" in failure["message"]
 
+    def test_probe_timeout_reports_distinct_failure(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "j10", "source": "/src", "destination": "/dest"}]
+
+        monkeypatch.setattr(
+            agent.restic,
+            "check_repo",
+            lambda *a, **kw: restic.RepoCheck(
+                None, "restic cat timed out after 120s and was killed", timed_out=True
+            ),
+        )
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(agent.restic, "ResticRunner", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")))
+
+        agent.run_agent()
+
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 124
+        assert "timed out after 120s" in failure["message"]
+        assert "network connection" in failure["message"]
+        # A hung connection is not an auth failure — no setup hint.
+        assert "vecta-agent setup" not in failure["message"]
+
+    def test_repo_init_timeout_reports_distinct_failure(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "j11", "source": "/src", "destination": "/dest"}]
+
+        init_calls = []
+        monkeypatch.setattr(agent.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
+        monkeypatch.setattr(
+            agent.restic,
+            "init_repo",
+            lambda *a, **kw: init_calls.append(a)
+            or restic.ResticResult(
+                exit_code=124,
+                stderr_tail="restic init timed out after 120s and was killed",
+                timed_out=True,
+            ),
+        )
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(agent.restic, "ResticRunner", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")))
+
+        agent.run_agent()
+
+        assert len(init_calls) == 1
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 124
+        assert "timed out after 120s" in failure["message"]
+        assert "vecta-agent setup" not in failure["message"]
+
     def test_repo_exists_skips_init(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
         fake = FakeApiClient("a1", "vc_" + "k" * 64)

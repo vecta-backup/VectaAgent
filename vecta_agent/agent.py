@@ -237,6 +237,19 @@ def _timeout_message() -> str:
     return f"Backup timed out after {MAX_BACKUP_DURATION_SECONDS:g}s and was terminated."
 
 
+def _destination_timeout_message(verb: str) -> str:
+    """Failure reason when a pre-backup restic command (the repo existence
+    probe or repo init) outlives the probe timeout — the destination
+    connection hung rather than returning a restic verdict, so this is a
+    network/credentials problem, not an authentication failure.
+    """
+    return (
+        f"Could not {verb} the backup destination — timed out after "
+        f"{restic.PROBE_TIMEOUT_SECONDS}s. Check your network connection and "
+        "destination credentials."
+    )
+
+
 def _timeout_watchdog(
     runner: restic.ResticRunner,
     timeout_event: threading.Event,
@@ -345,6 +358,12 @@ def _run_single_job(
                 logger.info("Repository at %s not found; initializing.", destination)
                 init_result = restic.init_repo(destination, env=job_env, port=port)
                 if init_result.exit_code != 0:
+                    if init_result.timed_out:
+                        message = _destination_timeout_message("initialize")
+                    else:
+                        message = (
+                            init_result.stderr_tail or "Failed to initialize repository."
+                        ) + _auth_failure_hint(init_result.stderr_tail, job_id)
                     client.report_status(
                         job_id,
                         {
@@ -352,8 +371,7 @@ def _run_single_job(
                             "run_id": run_id,
                             "status": "failed",
                             "exit_code": init_result.exit_code,
-"message": (init_result.stderr_tail or "Failed to initialize repository.")
-                    + _auth_failure_hint(init_result.stderr_tail, job_id),
+                            "message": message,
                         },
                     )
                     logger.error(
@@ -365,15 +383,21 @@ def _run_single_job(
                     return
                 logger.info("Repository at %s initialized.", destination)
             elif repo_check.exists is None:
+                if repo_check.timed_out:
+                    message = _destination_timeout_message("verify")
+                else:
+                    message = (
+                        repo_check.stderr_tail
+                        or "Could not verify repository at destination."
+                    ) + _auth_failure_hint(repo_check.stderr_tail, job_id)
                 client.report_status(
                     job_id,
                     {
                         "job_id": job_id,
                         "run_id": run_id,
                         "status": "failed",
-                        "exit_code": 1,
-                        "message": (repo_check.stderr_tail or "Could not verify repository at destination.")
-                        + _auth_failure_hint(repo_check.stderr_tail, job_id),
+                        "exit_code": 124 if repo_check.timed_out else 1,
+                        "message": message,
                     },
                 )
                 logger.error(

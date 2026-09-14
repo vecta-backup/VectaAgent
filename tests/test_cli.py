@@ -176,6 +176,24 @@ class TestCli:
         assert "storage unreachable" in capsys.readouterr().err
         assert not (tmp_config_dir / "restic.env").exists()
 
+    def test_repo_init_timeout(self, tmp_config_dir, monkeypatch, capsys):
+        monkeypatch.setattr(
+            cli.restic,
+            "init_repo",
+            lambda *a, **kw: restic.ResticResult(
+                exit_code=124,
+                stderr_tail="restic init timed out after 120s and was killed",
+                timed_out=True,
+            ),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["repo", "init", "/backups/data", "--password", "pw"])
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "timed out after 120s" in err
+        assert "network connection" in err
+        assert not (tmp_config_dir / "restic.env").exists()
+
     def test_repo_init_before_register_creates_config_dir(self, tmp_config_dir, monkeypatch, capsys):
         nested = tmp_config_dir / "not" / "yet" / "created"
         monkeypatch.setenv("VECTA_CONFIG_DIR", str(nested))
@@ -363,6 +381,60 @@ class TestSetup:
         err = capsys.readouterr().err
         assert "AccessDenied" in err
         assert "vecta-agent setup j1" in err  # auth hint
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_probe_timeout_reports_network_error(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        (tmp_config_dir / "restic.env").write_text("RESTIC_PASSWORD=test\n")
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        answers = iter(["AKIA", "shhh"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **kw: next(answers))
+        monkeypatch.setattr(
+            cli.restic,
+            "check_repo",
+            lambda *a, **kw: restic.RepoCheck(
+                None, "restic cat timed out after 120s and was killed", timed_out=True
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "timed out after 120s" in err
+        assert "network connection" in err
+        # A hung connection is not an auth failure — no setup hint.
+        assert "vecta-agent setup j1" not in err
+        assert not (tmp_config_dir / "credentials.toml").exists()
+
+    def test_init_timeout_reports_network_error(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        dest = "s3:https://acct.r2.cloudflarestorage.com/bucket"
+        self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
+
+        answers = iter(["AKIA", "shhh"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda *a, **kw: next(answers))
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False))
+        monkeypatch.setattr(
+            cli.restic,
+            "init_repo",
+            lambda *a, **kw: restic.ResticResult(
+                exit_code=124,
+                stderr_tail="restic init timed out after 120s and was killed",
+                timed_out=True,
+            ),
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["setup", "j1"])
+
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "timed out after 120s" in err
+        assert "vecta-agent setup j1" not in err
         assert not (tmp_config_dir / "credentials.toml").exists()
 
     def test_existing_repo_with_unknown_password_prompts(self, tmp_config_dir, monkeypatch, capsys):
