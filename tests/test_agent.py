@@ -190,6 +190,84 @@ class TestRunAgent:
         assert failure["exit_code"] == 130
         assert failure["message"] == "Cancelled by user"
 
+    def test_cancel_during_repo_probe(self, tmp_config_dir, monkeypatch):
+        # A hung destination connection (wrong S3/SFTP credentials) blocks in
+        # check_repo; the cancel poller must already be active and abort it.
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jcp", "source": "/src", "destination": "/dest"}]
+        fake.cancel_returns = [
+            {"cancel_requested": False},
+            {"cancel_requested": True},
+        ]
+
+        def fake_check_repo(destination, env=None, port=None, cancel_event=None, **kw):
+            # Simulate the hang: return only once the poller sets the event.
+            assert cancel_event is not None
+            cancel_event.wait(timeout=5)
+            return restic.RepoCheck(None, cancelled=cancel_event.is_set())
+
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(agent.restic, "check_repo", fake_check_repo)
+        monkeypatch.setattr(
+            agent.restic,
+            "init_repo",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no init expected")),
+        )
+        monkeypatch.setattr(
+            agent.restic,
+            "ResticRunner",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")),
+        )
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert fake.status_reports[0]["status"] == "running"
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 130
+        assert failure["message"] == "Cancelled by user"
+
+    def test_cancel_during_repo_init(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        fake.jobs = [{"job_id": "jci", "source": "/src", "destination": "/dest"}]
+        fake.cancel_returns = [
+            {"cancel_requested": False},
+            {"cancel_requested": True},
+        ]
+
+        monkeypatch.setattr(
+            agent.restic,
+            "check_repo",
+            lambda *a, **kw: restic.RepoCheck(False),
+        )
+
+        init_calls = []
+
+        def fake_init_repo(destination, env=None, port=None, cancel_event=None, **kw):
+            init_calls.append(destination)
+            cancel_event.wait(timeout=5)
+            return restic.ResticResult(exit_code=130, cancelled=cancel_event.is_set())
+
+        monkeypatch.setattr(agent.restic, "init_repo", fake_init_repo)
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(
+            agent.restic,
+            "ResticRunner",
+            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no backup expected")),
+        )
+        monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
+
+        agent.run_agent()
+
+        assert init_calls
+        failure = fake.status_reports[-1]
+        assert failure["status"] == "failed"
+        assert failure["exit_code"] == 130
+        assert failure["message"] == "Cancelled by user"
+
     def test_job_timeout_reports_distinct_failure(self, tmp_config_dir, monkeypatch):
         make_config(tmp_config_dir)
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
@@ -801,11 +879,11 @@ class TestDestinationCredentials:
         probe_env = {}
         init_env = {}
 
-        def fake_check(destination, env=None, port=None):
+        def fake_check(destination, env=None, port=None, cancel_event=None, **kw):
             probe_env.update(env or {})
             return restic.RepoCheck(False)
 
-        def fake_init(destination, env=None, port=None):
+        def fake_init(destination, env=None, port=None, cancel_event=None, **kw):
             init_env.update(env or {})
             return restic.ResticResult(exit_code=0)
 

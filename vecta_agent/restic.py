@@ -23,6 +23,11 @@ logger = logging.getLogger("vecta_agent")
 # user-configurable, like the 12h backup cap in agent.py.
 PROBE_TIMEOUT_SECONDS = 120
 
+# When `run_restic` runs with a cancel event, `communicate` is called in
+# slices of this length so the event is checked (and the process killed)
+# within about a second of cancellation being requested.
+CANCEL_POLL_SLICE_SECONDS = 1.0
+
 
 @dataclass
 class ResticResult:
@@ -36,6 +41,10 @@ class ResticResult:
     # finishing on its own; exit_code is then always 124 (the agent's
     # timeout convention, matching the backup watchdog).
     timed_out: bool = False
+    # True when the command was killed because the caller's cancel event was
+    # set (user cancellation reaching the probe/init phase); exit_code is
+    # then always 130.
+    cancelled: bool = False
 
 
 class ResticRunner:
@@ -171,12 +180,19 @@ def run_restic(
     args: list[str],
     env: dict[str, str] | None = None,
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> ResticResult:
     """Run a one-shot restic command and capture exit code + stderr tail.
 
     Bounded by `timeout_seconds`: on expiry the process is killed (no grace
     period — a one-shot command past its deadline is already hung) and the
     result carries `timed_out=True` with exit code 124.
+
+    With `cancel_event`, the wait happens in short slices and the process is
+    killed as soon as the event is set — the result carries `cancelled=True`
+    with exit code 130. This lets the agent's cancel poller stop a hung
+    probe/init (wrong credentials, unreachable destination) instead of
+    waiting out the full probe timeout.
     """
     full_env = {**os.environ, **(env or {})}
     proc = subprocess.Popen(
@@ -186,17 +202,44 @@ def run_restic(
         text=True,
         env=full_env,
     )
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()  # reap the killed process
-        return ResticResult(
-            exit_code=124,
-            stderr_tail=f"restic {args[0]} timed out after {timeout_seconds}s and was killed",
-            timed_out=True,
-        )
-    return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
+    if cancel_event is None:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()  # reap the killed process
+            return _timeout_result(args, timeout_seconds)
+        return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
+
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            proc.kill()
+            proc.communicate()  # reap the killed process
+            return _timeout_result(args, timeout_seconds)
+        try:
+            stdout, stderr = proc.communicate(
+                timeout=min(CANCEL_POLL_SLICE_SECONDS, remaining)
+            )
+            return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
+        except subprocess.TimeoutExpired:
+            if cancel_event.is_set():
+                proc.kill()
+                proc.communicate()  # reap the killed process
+                return ResticResult(
+                    exit_code=130,
+                    stderr_tail=f"restic {args[0]} was cancelled by user",
+                    cancelled=True,
+                )
+
+
+def _timeout_result(args: list[str], timeout_seconds: int) -> ResticResult:
+    return ResticResult(
+        exit_code=124,
+        stderr_tail=f"restic {args[0]} timed out after {timeout_seconds}s and was killed",
+        timed_out=True,
+    )
 
 
 class RepoCheck:
@@ -209,6 +252,9 @@ class RepoCheck:
     `timed_out` is True when the probe was killed by the timeout instead of
     finishing with a restic verdict — `exists` is then None, but the caller
     should report a network-timeout failure rather than suggesting setup.
+
+    `cancelled` is True when the probe was killed because the cancel event
+    was set (user cancellation); `exists` is then None too.
     """
 
     def __init__(
@@ -216,10 +262,12 @@ class RepoCheck:
         exists: bool | None,
         stderr_tail: str = "",
         timed_out: bool = False,
+        cancelled: bool = False,
     ) -> None:
         self.exists = exists
         self.stderr_tail = stderr_tail
         self.timed_out = timed_out
+        self.cancelled = cancelled
 
 
 def _looks_missing(stderr: str) -> bool:
@@ -242,6 +290,7 @@ def check_repo(
     env: dict[str, str] | None = None,
     port: int | None = None,
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> RepoCheck:
     """Probe whether a restic repository exists at `destination`.
 
@@ -250,10 +299,15 @@ def check_repo(
     the check is inconclusive and the caller must NOT initialize.
 
     Bounded by `timeout_seconds`: a probe that outlives it (a hung connection,
-    not a restic verdict) returns `exists=None, timed_out=True`.
+    not a restic verdict) returns `exists=None, timed_out=True`. A probe killed
+    via `cancel_event` returns `exists=None, cancelled=True`.
     """
     args = [*repo_options(destination, port), "cat", "config", "--repo", destination]
-    result = run_restic(args, env=env, timeout_seconds=timeout_seconds)
+    result = run_restic(
+        args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    )
+    if result.cancelled:
+        return RepoCheck(None, result.stderr_tail, cancelled=True)
     if result.timed_out:
         return RepoCheck(None, result.stderr_tail, timed_out=True)
     if result.exit_code == 0:
@@ -270,10 +324,13 @@ def init_repo(
     env: dict[str, str] | None = None,
     port: int | None = None,
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
 ) -> ResticResult:
     """Initialize a new restic repository at `destination`."""
     args = [*repo_options(destination, port), "init", "--repo", destination]
-    return run_restic(args, env=env, timeout_seconds=timeout_seconds)
+    return run_restic(
+        args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    )
 
 
 def parse_summary(obj: dict[str, Any]) -> dict[str, Any]:

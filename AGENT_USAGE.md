@@ -160,6 +160,9 @@ for each job:
         - exists        -> proceed
         - missing       -> initialize it (restic init)
         - indeterminate -> report "failed" (do NOT initialize)
+      cancellation polling covers this phase too: a cancel kills the hung
+      probe/init command and reports "Cancelled by user" instead of waiting
+      out the 120s probe timeout
 
     run restic backup (source -> destination), streaming progress + polling cancel
     a watchdog kills restic after 12h and reports a distinct timeout failure

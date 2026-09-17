@@ -205,14 +205,48 @@ def _progress_reporter(
             logger.warning("Failed to report progress for job %s: %s", job_id, exc)
 
 
+class _JobTerminator:
+    """Terminates whichever restic invocation is currently active for a job.
+
+    During the repo probe/init phase the active command is a one-shot
+    `run_restic` call that watches a cancel event; during the backup phase it
+    is the ResticRunner subprocess. The cancel poller calls terminate()
+    without needing to know which phase is active.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._probe_event: threading.Event | None = None
+        self._runner: restic.ResticRunner | None = None
+
+    def set_probe(self, event: threading.Event) -> None:
+        with self._lock:
+            self._probe_event = event
+
+    def set_runner(self, runner: restic.ResticRunner) -> None:
+        with self._lock:
+            self._probe_event = None
+            self._runner = runner
+
+    def terminate(self, grace_seconds: float = 10.0) -> None:
+        with self._lock:
+            probe_event = self._probe_event
+            runner = self._runner
+        if runner is not None:
+            runner.terminate(grace_seconds)
+        elif probe_event is not None:
+            probe_event.set()
+
+
 def _cancel_poller(
     client: api.ApiClient,
     job_id: str,
     cancel_event: threading.Event,
     done_event: threading.Event,
-    runner: restic.ResticRunner,
+    terminator: _JobTerminator,
 ) -> None:
-    """Poll backend cancel flag every ~10 seconds and terminate restic if set."""
+    """Poll backend cancel flag every ~10 seconds and terminate the active
+    restic invocation (repo probe, init, or backup) if set."""
     while not done_event.wait(CANCEL_INTERVAL_SECONDS):
         try:
             data = client.cancel_status(job_id)
@@ -224,7 +258,7 @@ def _cancel_poller(
 
         if data.get("cancel_requested"):
             cancel_event.set()
-            runner.terminate()
+            terminator.terminate()
             logger.info("Cancellation requested for job %s; terminating restic.", job_id)
             break
 
@@ -265,6 +299,27 @@ def _timeout_watchdog(
     timeout_event.set()
     runner.terminate()
     logger.warning("Job exceeded the maximum duration; terminating restic. %s", _timeout_message())
+
+
+def _report_cancelled(
+    client: api.ApiClient,
+    job_id: str,
+    run_id: str,
+    start_time: float,
+) -> None:
+    """Report the standard user-cancellation failure for a job."""
+    client.report_status(
+        job_id,
+        {
+            "job_id": job_id,
+            "run_id": run_id,
+            "status": "failed",
+            "exit_code": 130,
+            "message": "Cancelled by user",
+            "duration_seconds": int(time.monotonic() - start_time),
+        },
+    )
+    logger.info("Job %s cancelled.", job_id)
 
 
 def _resolve_job_env(
@@ -324,6 +379,12 @@ def _run_single_job(
     if not lock.acquire():
         return
 
+    start_time = time.monotonic()
+    cancel_event = threading.Event()
+    done_event = threading.Event()
+    terminator = _JobTerminator()
+    cancel_thread: threading.Thread | None = None
+
     try:
         client.report_status(
             job_id, {"job_id": job_id, "run_id": run_id, "status": "running"}
@@ -352,11 +413,32 @@ def _run_single_job(
             logger.error("Job %s failed: no repository password configured.", job_id)
             return
 
+        # The cancel poller starts before the repo probe: a hung destination
+        # connection (wrong S3/SFTP credentials, firewalled host) would
+        # otherwise be uncancellable until the probe timeout fires.
+        terminator.set_probe(cancel_event)
+        cancel_thread = threading.Thread(
+            target=_cancel_poller,
+            args=(client, job_id, cancel_event, done_event, terminator),
+            daemon=True,
+        )
+        cancel_thread.start()
+
         try:
-            repo_check = restic.check_repo(destination, env=job_env, port=port)
+            repo_check = restic.check_repo(
+                destination, env=job_env, port=port, cancel_event=cancel_event
+            )
+            if repo_check.cancelled or cancel_event.is_set():
+                _report_cancelled(client, job_id, run_id, start_time)
+                return
             if repo_check.exists is False:
                 logger.info("Repository at %s not found; initializing.", destination)
-                init_result = restic.init_repo(destination, env=job_env, port=port)
+                init_result = restic.init_repo(
+                    destination, env=job_env, port=port, cancel_event=cancel_event
+                )
+                if init_result.cancelled or cancel_event.is_set():
+                    _report_cancelled(client, job_id, run_id, start_time)
+                    return
                 if init_result.exit_code != 0:
                     if init_result.timed_out:
                         message = _destination_timeout_message("initialize")
@@ -421,7 +503,6 @@ def _run_single_job(
             logger.error("Job %s failed: restic binary not found in PATH.", job_id)
             return
 
-        start_time = time.monotonic()
         runner = restic.ResticRunner(source, destination, port=port, env=job_env)
         try:
             runner.start()
@@ -439,19 +520,19 @@ def _run_single_job(
             logger.error("Job %s failed: restic executable not found on PATH.", job_id)
             return
 
+        terminator.set_runner(runner)
+        if cancel_event.is_set():
+            # Cancellation landed between the probe phase and backup start;
+            # the poller has already stopped, so terminate the backup process
+            # here and let the cancel check below report it.
+            runner.terminate()
+
         stats: dict[str, Any] = {}
-        cancel_event = threading.Event()
         timeout_event = threading.Event()
-        done_event = threading.Event()
 
         progress_thread = threading.Thread(
             target=_progress_reporter,
             args=(client, job_id, run_id, start_time, stats, done_event),
-            daemon=True,
-        )
-        cancel_thread = threading.Thread(
-            target=_cancel_poller,
-            args=(client, job_id, cancel_event, done_event, runner),
             daemon=True,
         )
         timeout_thread = threading.Thread(
@@ -460,7 +541,6 @@ def _run_single_job(
             daemon=True,
         )
         progress_thread.start()
-        cancel_thread.start()
         timeout_thread.start()
 
         try:
@@ -479,22 +559,12 @@ def _run_single_job(
             exit_code = runner.wait()
             done_event.set()
             progress_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
-            cancel_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
             timeout_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
 
         duration = int(time.monotonic() - start_time)
 
         if cancel_event.is_set():
-            payload = {
-                "job_id": job_id,
-                "run_id": run_id,
-                "status": "failed",
-                "exit_code": 130,
-                "message": "Cancelled by user",
-                "duration_seconds": duration,
-            }
-            client.report_status(job_id, payload)
-            logger.info("Job %s cancelled.", job_id)
+            _report_cancelled(client, job_id, run_id, start_time)
             return
 
         if timeout_event.is_set():
@@ -553,6 +623,9 @@ def _run_single_job(
             client.report_status(job_id, payload)
             logger.error("Job %s failed with exit code %s.", job_id, exit_code)
     finally:
+        done_event.set()
+        if cancel_thread is not None:
+            cancel_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
         lock.release()
 
 

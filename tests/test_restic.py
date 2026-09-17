@@ -1,13 +1,16 @@
 import subprocess
+import threading
+import time
 
 from vecta_agent import restic
 
 
 class FakeResult:
-    def __init__(self, exit_code, stderr_tail="", timed_out=False):
+    def __init__(self, exit_code, stderr_tail="", timed_out=False, cancelled=False):
         self.exit_code = exit_code
         self.stderr_tail = stderr_tail
         self.timed_out = timed_out
+        self.cancelled = cancelled
 
 
 class TestRepoOptions:
@@ -151,6 +154,61 @@ class TestRunRestic:
         assert result.exit_code == 124
         assert "timed out after 3s" in result.stderr_tail
 
+    def test_cancel_event_kills_process_and_reports_cancelled(self, monkeypatch):
+        killed = []
+        event = threading.Event()
+
+        class CancellableProc:
+            returncode = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def communicate(self, timeout=None):
+                if not killed:
+                    event.set()
+                    raise subprocess.TimeoutExpired(cmd="restic", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                killed.append(True)
+
+        monkeypatch.setattr(restic.subprocess, "Popen", CancellableProc)
+        result = restic.run_restic(["cat", "config", "--repo", "r"], cancel_event=event)
+        assert killed == [True]
+        assert result.cancelled is True
+        assert result.timed_out is False
+        assert result.exit_code == 130
+        assert "cancelled" in result.stderr_tail
+
+    def test_cancel_mode_still_enforces_timeout(self, monkeypatch):
+        killed = []
+
+        class HangingProc:
+            returncode = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def communicate(self, timeout=None):
+                if not killed:
+                    time.sleep(timeout)
+                    raise subprocess.TimeoutExpired(cmd="restic", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                killed.append(True)
+
+        monkeypatch.setattr(restic.subprocess, "Popen", HangingProc)
+        result = restic.run_restic(
+            ["cat", "config", "--repo", "r"],
+            timeout_seconds=0.3,
+            cancel_event=threading.Event(),  # never set
+        )
+        assert killed == [True]
+        assert result.timed_out is True
+        assert result.exit_code == 124
+
 
 class TestCheckRepo:
     def test_exists(self, monkeypatch):
@@ -215,6 +273,18 @@ class TestCheckRepo:
         assert check.exists is None
         assert check.timed_out is True
 
+    def test_cancelled_is_indeterminate_and_flagged(self, monkeypatch):
+        monkeypatch.setattr(
+            restic, "run_restic",
+            lambda *a, **kw: FakeResult(
+                130, "restic cat was cancelled by user", cancelled=True
+            ),
+        )
+        check = restic.check_repo("r1")
+        assert check.exists is None
+        assert check.cancelled is True
+        assert check.timed_out is False
+
     def test_passes_default_timeout(self, monkeypatch):
         captured = {}
 
@@ -225,6 +295,18 @@ class TestCheckRepo:
         monkeypatch.setattr(restic, "run_restic", fake_run_restic)
         restic.check_repo("r1")
         assert captured["timeout_seconds"] == restic.PROBE_TIMEOUT_SECONDS
+
+    def test_passes_cancel_event(self, monkeypatch):
+        captured = {}
+
+        def fake_run_restic(args, env=None, **kw):
+            captured.update(kw)
+            return FakeResult(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run_restic)
+        event = threading.Event()
+        restic.check_repo("r1", cancel_event=event)
+        assert captured["cancel_event"] is event
 
 
 class TestInitRepo:
@@ -238,6 +320,18 @@ class TestInitRepo:
         monkeypatch.setattr(restic, "run_restic", fake_run_restic)
         restic.init_repo("dest")
         assert calls[0][0] == ["init", "--repo", "dest"]
+
+    def test_passes_cancel_event(self, monkeypatch):
+        captured = {}
+
+        def fake_run_restic(args, env=None, **kw):
+            captured.update(kw)
+            return FakeResult(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run_restic)
+        event = threading.Event()
+        restic.init_repo("dest", cancel_event=event)
+        assert captured["cancel_event"] is event
 
 
 class TestParseSummary:
