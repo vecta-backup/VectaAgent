@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import logging
+import os
 import secrets
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 from vecta_agent import __version__, agent, api, config, credentials, restic, update
 
 logger = logging.getLogger("vecta_agent")
+_IS_POSIX = os.name == "posix"
 
 
 def _setup_logging() -> None:
@@ -449,9 +451,24 @@ def run_update(args: argparse.Namespace) -> None:
     update.run_update(requested_version=args.version, check_only=args.check)
 
 
+def _require_root(args: argparse.Namespace) -> None:
+    """Require root for commands that can access arbitrary backup data."""
+    if not _IS_POSIX or os.geteuid() == 0 or args.allow_non_root:
+        return
+    raise SystemExit(
+        "vecta-agent must be run as root on Linux. Re-run with sudo, or explicitly "
+        "use --allow-non-root if this invocation should run as the current user."
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="vecta-agent")
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument(
+        "--allow-non-root",
+        action="store_true",
+        help="Allow operational commands to run without root privileges (Linux only)",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     register_parser = subparsers.add_parser("register", help="Register this machine with Vecta")
@@ -508,6 +525,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     _setup_logging()
     try:
+        if args.command != "version":
+            _require_root(args)
         args.func(args)
     except SystemExit:
         raise

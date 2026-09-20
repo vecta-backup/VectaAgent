@@ -14,13 +14,13 @@ Stateless backup agent for the [Vecta](https://vectaapp.com) platform. Runs on L
 
 ```bash
 # 1. Register this machine (one-time)
-vecta-agent register --token <REGISTRATION_TOKEN>
+sudo vecta-agent register --token <REGISTRATION_TOKEN>
 
 # 2. Create a job in the Vecta dashboard, then run once on this machine:
-vecta-agent setup <JOB_ID>
+sudo vecta-agent setup <JOB_ID>
 
 # 3. Run backups (single pass; call from cron)
-vecta-agent run
+sudo vecta-agent run
 ```
 
 `setup` fetches the job's non-secret config from the backend, stores the destination
@@ -60,10 +60,10 @@ pip install -e .
 
 | Command | Description |
 |---------|-------------|
-| `vecta-agent register --token <TOKEN>` | Register this machine with Vecta |
-| `vecta-agent setup <JOB_ID>` | Store credentials for a job's destination and initialize its repository |
-| `vecta-agent repo init <DEST>` | Initialize a restic repository at destination (manual escape hatch) |
-| `vecta-agent run` | Execute due backup jobs (single pass) |
+| `sudo vecta-agent register --token <TOKEN>` | Register this machine with Vecta |
+| `sudo vecta-agent setup <JOB_ID>` | Store credentials for a job's destination and initialize its repository |
+| `sudo vecta-agent repo init <DEST>` | Initialize a restic repository at destination (manual escape hatch) |
+| `sudo vecta-agent run` | Execute due backup jobs (single pass) |
 | `vecta-agent version` | Show version |
 | `vecta-agent update` | Update the installed binary to the latest GitHub release (`--check` to compare only, `--version vX.Y.Z` to pin) |
 
@@ -78,6 +78,13 @@ vecta-agent repo init <DESTINATION> --password-file <F>  # password from file
 ```
 
 The agent also auto-initializes missing repositories on `run` if a password is configured.
+
+### Root privileges
+
+On Linux, operational commands (`register`, `setup`, `repo init`, `run`, and `update`) must be
+run as root so the agent can access the machine's backup data and system installation paths. Use
+`sudo vecta-agent ...`. For an intentional per-user invocation, pass `--allow-non-root` before
+the subcommand; this is an escape hatch and may prevent access to protected source paths.
 
 ## Configuration
 

@@ -20,6 +20,34 @@ class FakeSetupClient:
 
 
 class TestCli:
+    def test_operational_commands_require_root_on_posix(self, monkeypatch):
+        monkeypatch.setattr(cli, "_IS_POSIX", True)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["run"])
+
+        assert "must be run as root" in str(exc.value)
+        assert "--allow-non-root" in str(exc.value)
+
+    def test_allow_non_root_override(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        monkeypatch.setattr(cli, "_IS_POSIX", True)
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+        ran = []
+        monkeypatch.setattr(cli.agent, "run_agent", lambda: ran.append(True))
+
+        cli.main(["--allow-non-root", "run"])
+
+        assert ran
+
+    def test_version_does_not_require_root(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli, "_IS_POSIX", True)
+
+        cli.main(["version"])
+
+        assert capsys.readouterr().out.strip() == __version__
+
     def test_version(self, capsys):
         cli.main(["version"])
         captured = capsys.readouterr()
