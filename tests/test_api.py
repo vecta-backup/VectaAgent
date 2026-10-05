@@ -5,7 +5,6 @@ from vecta_agent import __version__, api
 
 
 def _resp(method, url, status=200, json=None, text=""):
-    body = json if json is not None else text
     if json is not None:
         return httpx.Response(status, json=json, request=httpx.Request(method, url))
     return httpx.Response(status, text=text, request=httpx.Request(method, url))
@@ -148,6 +147,21 @@ class TestApiClient:
         client = api.ApiClient("a1", "vc_k1", base_url="http://test/api")
         client.report_status("j1", {"status": "running"})
         assert calls[0]["status"] == "running"
+
+    def test_report_capabilities(self, monkeypatch):
+        calls = []
+
+        def fake_request(method, url, headers=None, json=None):
+            calls.append((method, url, headers, json))
+            return _resp(method, url, 200, {"status": "ok"})
+
+        monkeypatch.setattr(api.httpx, "Client", lambda **kw: _FakeClient(fake_request))
+        client = api.ApiClient("a1", "vc_k1", base_url="http://test/api")
+        payload = {"features": ["hook_catalog_v1"], "hooks": []}
+        client.report_capabilities(payload)
+        assert calls[0][0:2] == ("POST", "http://test/api/agents/a1/capabilities")
+        assert calls[0][2]["Authorization"] == "Bearer vc_k1"
+        assert calls[0][3] == payload
 
     def test_cancel_status(self, monkeypatch):
         def fake_request(method, url, headers=None, json=None):

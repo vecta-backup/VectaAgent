@@ -31,7 +31,6 @@ htmlcov/
 
 # Local / agent docs (not for public repo)
 AGENTS.md
-AGENT_SPEC.md
 FRONTEND_SETUP_REFERENCE.md
 
 # OS

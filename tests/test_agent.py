@@ -1,7 +1,5 @@
 import tempfile
-import threading
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -17,6 +15,7 @@ class FakeApiClient:
         self.me_called = False
         self.jobs: list[dict] = []
         self.status_reports: list[dict] = []
+        self.capability_reports: list[dict] = []
         self.cancel_returns: list[dict] = []
         self.cancel_call_count = 0
 
@@ -26,6 +25,9 @@ class FakeApiClient:
 
     def fetch_jobs(self):
         return self.jobs
+
+    def report_capabilities(self, payload):
+        self.capability_reports.append(payload)
 
     def report_status(self, job_id, payload):
         self.status_reports.append({"job_id": job_id, **payload})
@@ -103,6 +105,39 @@ class TestRunAgent:
         assert fake.me_called
         assert fake.status_reports == []
         assert "No jobs due" in caplog.text
+
+    def test_reports_startup_capabilities(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(agent.hooks, "load_catalog", lambda: {})
+        monkeypatch.setattr(agent.postgresql, "postgresql_support_issue", lambda: None)
+
+        agent.run_agent()
+
+        assert fake.capability_reports == [{
+            "features": ["hook_catalog_v1", "postgresql_stdin_backup"],
+            "hooks": [],
+            "checks": {
+                "hook_catalog_v1": {"status": "available"},
+                "postgresql_stdin_backup": {"status": "available"},
+            },
+        }]
+
+    def test_reports_missing_postgresql_dependency(self, tmp_config_dir, monkeypatch):
+        make_config(tmp_config_dir)
+        fake = FakeApiClient("a1", "vc_" + "k" * 64)
+        monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
+        monkeypatch.setattr(agent.hooks, "load_catalog", lambda: {})
+        monkeypatch.setattr(agent.postgresql, "postgresql_support_issue", lambda: "pg_dump_missing")
+
+        agent.run_agent()
+
+        assert fake.capability_reports[0]["checks"]["postgresql_stdin_backup"] == {
+            "status": "unavailable",
+            "reason": "pg_dump_missing",
+        }
+        assert "postgresql_stdin_backup" not in fake.capability_reports[0]["features"]
 
     def test_job_success(self, tmp_config_dir, monkeypatch, caplog):
         make_config(tmp_config_dir)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vecta-agent"
-version = "0.5.1"
+version = "0.6.0"
 description = "Stateless backup agent for the Vecta platform"
 requires-python = ">=3.12"
 dependencies = [
@@ -23,3 +23,6 @@ include = ["vecta_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -11,7 +11,7 @@ the source of truth when the frontend/dashboard UI and the agent fall out of syn
 There are only two one-time setup steps, and one always-on step:
 
 1. **Register the machine** — proves "this machine is allowed to talk to Vecta".
-2. **Set up the destination** — run `vecta-agent setup <JOB_ID>` once after creating a job
+2. **Set up the destination** — run `sudo vecta-agent setup <JOB_ID>` once after creating a job
    in the dashboard: it stores the destination's credentials locally and initializes the
    (encrypted) restic repository.
 3. **Run** — done automatically by cron every few minutes. The agent pulls jobs from the
@@ -27,7 +27,7 @@ The agent is a dumb worker: it asks "what should I do now?", does it, and exits.
 Run this once on each machine that will be backed up:
 
 ```bash
-vecta-agent register --token <REGISTRATION_TOKEN>
+sudo vecta-agent register --token <REGISTRATION_TOKEN>
 ```
 
 - The token is generated in the dashboard (`POST /api/agents/generate-token`) and is
@@ -41,11 +41,12 @@ vecta-agent register --token <REGISTRATION_TOKEN>
 
 ## Step 2 — Set up the destination (one-time, per destination)
 
-Create the job in the Vecta dashboard first — it only collects non-secret config
-(source path, destination URL, schedule). Then run once on the agent machine:
+Create the job in the Vecta dashboard first — database settings, file paths, hooks, and
+destination details are non-secret config. Database passwords remain local. Then run once
+on the agent machine:
 
 ```bash
-vecta-agent setup <JOB_ID>
+sudo vecta-agent setup <JOB_ID>
 ```
 
 The command:
@@ -69,6 +70,103 @@ The command:
 Credentials are stored in `~/.config/vecta/credentials.toml` (chmod 600), keyed by a
 fingerprint of the destination — see [Destination credentials](#destination-credentials).
 
+### PostgreSQL database jobs
+
+For a PostgreSQL job, `setup` also fetches the non-secret connection settings and asks for
+the database password using hidden input (twice for confirmation). The password is stored
+in a connection-scoped libpq password file named `pgpass-<fingerprint>.conf` in the Vecta
+configuration directory, with mode `0600`. It is separate from destination credentials,
+so entering a database password never replaces cloud/SFTP credentials. The agent sets
+`PGPASSFILE` only for the Restic child process that runs `pg_dump`.
+
+Install `pg_dump` 9.0 or newer and Restic 0.17.0 or newer on the agent. Capability
+reporting checks both version output and Restic's backup help for `--stdin-from-command`
+and `--stdin-filename`. Setup checks the local tool requirements, prompts for a password
+when needed, and runs a bounded schema-only `pg_dump` connection test (up to 30 seconds).
+It verifies database connectivity and schema access, but does not create a full archive or
+test the Restic upload; the first backup run is the end-to-end check. The password is saved
+to its mode-0600 pgpass file after destination/repository setup completes.
+
+PostgreSQL uses a custom archive stream named `postgresql-<sanitized-database>.dump` in
+the snapshot. The agent invokes a typed `pg_dump -Fc -Z 0` argv through Restic's
+`--stdin-from-command` mode. Restic waits for the producer and does not create a snapshot
+when the command fails. The archive is not first written as a full temporary dump file;
+Restic caches, temporary upload files, local repositories, and runtime data still use
+disk. `-Z 0` is an initial deduplication candidate, not a storage-reduction guarantee.
+Restic compression is available only with Restic 0.14+ and repository format v2; the
+agent does not upgrade existing repositories to enable it.
+
+To restore the archived database manually, extract the run's `stdin_filename` from Restic
+and pipe it to `pg_restore` (substitute shell-quoted values and provide local Restic and
+PostgreSQL credentials). The generated command does not configure `pg_restore` authentication;
+the agent's connection-scoped pgpass file is used for backup runs, not automatically for
+restores. Configure libpq credentials for the target database under the user running
+`pg_restore`:
+
+```bash
+sudo restic --repo '<repository>' dump '<snapshot-id>' 'postgresql-orders.dump' \
+  | pg_restore --dbname='<target-database>'
+```
+
+The dashboard stores `backup_type` and `stdin_filename` on each run so later job edits do
+not change historical restore instructions. A failed dump is not a verified restorable
+snapshot.
+
+### Local hook catalog
+
+Hooks are optional, root-managed local capabilities. The default catalog is
+`/etc/vecta/hooks.toml`; the catalog, every parent directory, and each executable must be
+root-owned and not writable by group or other users. Symlinks are rejected. A missing or
+invalid catalog advertises no hooks and selected unknown/removed hooks fail closed.
+
+For an interactive setup, install the executable and run `sudo vecta-agent hooks add`.
+Then run `vecta-agent hooks validate` and `vecta-agent hooks list`; `sudo vecta-agent hooks publish`
+updates the dashboard immediately. Normal `vecta-agent run` also reports the
+catalog, so publishing manually is only needed when you want the dashboard refreshed now.
+The wizard defaults to the `vecta-hook` account, which the machine administrator must
+provision, or you can choose another existing service account.
+
+Example entry (metadata is sent to the backend; executable and argv mapping stay local):
+
+```toml
+[[hooks]]
+id = "refresh-cache"
+name = "Refresh application cache"
+description = "Refresh the cache for the configured service."
+phases = ["pre", "post"]
+executable = "/usr/local/libexec/vecta-refresh-cache"
+argv = ["--service", "${service}"]
+run_as = "vecta-hook"
+requires_root = false
+timeout_seconds = 60
+output_limit_bytes = 8192
+parameters_schema = { type = "object", properties = { service = { type = "string", minLength = 1, maxLength = 64, pattern = "[A-Za-z0-9_-]+" } }, required = ["service"], additionalProperties = false }
+```
+
+Parameter schema supports narrow string, integer, and boolean values. A parameter
+placeholder must occupy a whole argv element. Hook arguments are executed directly with
+`shell=False`; jobs cannot supply paths, commands, argv, working directories, or
+environment overrides. `run_as = "root"` is permitted only with `requires_root = true`;
+otherwise hooks run as the named local service account. The default `vecta-hook` account
+is not provisioned by this repository's installer and must be created by the machine
+administrator (or installer integration). If privilege dropping fails, the hook does not
+run as root as a fallback.
+
+Catalog timeout/output limits can only tighten the agent caps: 120 seconds and 16 KiB per
+output stream. Hook output is bounded and is not included in backend status. Cancellation
+interrupts active pre-hooks, source capture, Restic, and a post-hook on the normal success
+path. After a failure/cancellation, a configured post-hook gets one bounded cleanup
+opportunity; a repeated cancellation does not interrupt that cleanup.
+
+During each run pass, the agent reports `postgresql_stdin_backup` only when Restic 0.17.0+, pg_dump
+9.0+, and both stdin flags are available. It also reports a safe check for each known feature.
+Unavailable checks use a fixed reason code, such as `pg_dump_missing` or
+`restic_stdin_options_missing`, so the dashboard can explain what to fix. It reports
+`hook_catalog_v1` and safe hook metadata only when the catalog validates; an invalid catalog
+is reported as `hook_catalog_invalid`. Reports never contain local executable paths, command
+output, script contents, credentials, or secret file paths. This negotiation is compatibility
+metadata, not a trust boundary for jobs.
+
 ### The password rules (important)
 
 - The repository password **encrypts the repository**. It is stored **only on the machine**
@@ -79,13 +177,13 @@ fingerprint of the destination — see [Destination credentials](#destination-cr
 
 ### `repo init` — manual escape hatch
 
-`vecta-agent repo init <DESTINATION>` (--generate / --password / --password-file) still
+`sudo vecta-agent repo init <DESTINATION>` (--generate / --password / --password-file) still
 exists for setting up a repository without a dashboard job. It stores the password in the
 global `restic.env` and **never overwrites** an existing repository or password: if the
 repository already exists, it prints
 `Repository at <DESTINATION> is already initialized.` and does not touch `restic.env`.
 
-> To attach an **existing** repository to a **new** machine, run `vecta-agent setup`
+> To attach an **existing** repository to a **new** machine, run `sudo vecta-agent setup`
 > for a job with that destination — it detects the existing repository and prompts for
 > its password (typed twice, hidden input), then stores it per-destination.
 
@@ -128,6 +226,13 @@ working off `restic.env` / process env / instance roles.
 ---
 
 ## Step 3 — Running (cron)
+
+On Linux, `register`, `setup`, `hooks add`, `hooks publish`, `repo init`, `run`, and `update` require root because they
+access backup data, protected configuration, or the installed binary. Use `sudo` for manual
+invocations. `version` and `help` remain available without root. To intentionally run an
+operational command as the current user, put `--allow-non-root` before the subcommand, for
+example `vecta-agent --allow-non-root run`; protected paths may then be inaccessible. This
+enforcement does not change non-POSIX behavior.
 
 The agent is **not a daemon**. Cron invokes it every few minutes and it does a single pass:
 
@@ -190,8 +295,11 @@ Key points:
 | `~/.config/vecta/config.toml` | `agent_id`, `api_key`, `name` | `register` |
 | `~/.config/vecta/restic.env` | global `RESTIC_PASSWORD` (+ optional cloud creds) | `repo init` (or you, manually) |
 | `~/.config/vecta/credentials.toml` | per-destination credentials (one `[<fingerprint>]` section per destination) | `setup` (or you, manually) |
+| `~/.config/vecta/pgpass-<fingerprint>.conf` | connection-scoped PostgreSQL password | `setup` |
+| `/etc/vecta/hooks.toml` | root-controlled local hook catalog | `hooks add` (or machine administrator) |
 
-All are chmod 600. Cloud credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.)
+Configuration and credential files are chmod 600. The hook catalog and executables must
+remain root-controlled and not writable by group or other users. Cloud credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, etc.)
 are **never** stored on the backend; put them in `restic.env` or let `vecta-agent setup`
 store them per destination in `credentials.toml`.
 
@@ -201,9 +309,9 @@ store them per destination in `credentials.toml`.
 
 | Message | What it means | What to do |
 |---|---|---|
-| `Config not found ... Run 'vecta-agent register --token <TOKEN>' first` | Machine not registered | Register (Step 1). |
-| `No repository password configured for this destination. Run 'vecta-agent setup <JOB_ID>' ...` | A job ran but no repo password exists for its destination | Run `vecta-agent setup <JOB_ID>` on this machine. |
-| `This looks like an authentication failure. Run 'vecta-agent setup <JOB_ID>' ...` | restic hit an auth error (missing/wrong stored credentials or SSH keys) | Run `vecta-agent setup <JOB_ID>` to (re)configure this destination's credentials. |
+| `Config not found ... Run 'vecta-agent register --token <TOKEN>' first` | Machine not registered | Register with `sudo vecta-agent register --token <TOKEN>` (Step 1). |
+| `No repository password configured for this destination. Run 'vecta-agent setup <JOB_ID>' ...` | A job ran but no repo password exists for its destination | Run `sudo vecta-agent setup <JOB_ID>` on this machine. |
+| `This looks like an authentication failure. Run 'vecta-agent setup <JOB_ID>' ...` | restic hit an auth error (missing/wrong stored credentials or SSH keys) | Run `sudo vecta-agent setup <JOB_ID>` to (re)configure this destination's credentials. |
 | `Repository at <DESTINATION> is already initialized.` | You re-ran `repo init` on an existing repo | Nothing — this is fine and safe. The existing password was not changed. |
 | `SSH key authentication to the SFTP destination failed.` | The SSH key-auth probe in `setup` failed | Run the printed `ssh-keygen` / `ssh-copy-id` commands, then re-run setup. |
 | `restic executable not found on PATH` | restic binary is missing | Install restic. |

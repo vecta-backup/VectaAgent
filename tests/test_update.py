@@ -194,6 +194,7 @@ class TestRunUpdate:
 
     def test_install_flow(self, tmp_path, monkeypatch, capsys):
         installed = []
+        monkeypatch.setattr(update, "_require_root", lambda: None)
 
         def fake_install(tag, target):
             installed.append((tag, target))
@@ -217,6 +218,7 @@ class TestRunUpdate:
 
     def test_explicit_version_installs_even_if_older(self, tmp_path, monkeypatch, capsys):
         installed = []
+        monkeypatch.setattr(update, "_require_root", lambda: None)
         monkeypatch.setattr(update, "target_binary_path", lambda: str(tmp_path / "vecta-agent"))
         monkeypatch.setattr(update, "install", lambda tag, target: installed.append(tag))
         update.run_update(requested_version="0.1.0")
@@ -224,6 +226,7 @@ class TestRunUpdate:
 
     def test_explicit_version_without_v_prefix(self, tmp_path, monkeypatch, capsys):
         installed = []
+        monkeypatch.setattr(update, "_require_root", lambda: None)
         monkeypatch.setattr(update, "target_binary_path", lambda: str(tmp_path / "vecta-agent"))
         monkeypatch.setattr(update, "install", lambda tag, target: installed.append(tag))
         update.run_update(requested_version="1.2.3")

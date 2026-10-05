@@ -89,7 +89,7 @@ class ApiClient:
                     )
                 else:
                     return response
-            except httpx.TimeoutException as exc:
+            except httpx.TimeoutException:
                 last_err = ApiError(f"Request to {url} timed out after 30.0s")
             except httpx.NetworkError as exc:
                 last_err = ApiError(f"Could not reach {url}: {exc}")
@@ -135,6 +135,16 @@ class ApiClient:
     def me(self) -> dict[str, Any]:
         """GET /agents/{id}/me — validates credentials and stamps last_seen_at."""
         response = self._request_with_retry("GET", self._url(f"/agents/{self.agent_id}/me"))
+        self._check_error(response)
+        return response.json()
+
+    def report_capabilities(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST the agent's validated local capabilities."""
+        response = self._request_with_retry(
+            "POST",
+            self._url(f"/agents/{self.agent_id}/capabilities"),
+            json=payload,
+        )
         self._check_error(response)
         return response.json()
 

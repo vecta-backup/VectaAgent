@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import os
 import secrets
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-from vecta_agent import __version__, agent, api, config, credentials, restic, update
+from vecta_agent import __version__, agent, api, config, credentials, hooks, postgresql, restic, update
 
 logger = logging.getLogger("vecta_agent")
 _IS_POSIX = os.name == "posix"
@@ -303,6 +305,58 @@ def run_setup(args: argparse.Namespace) -> None:
     client = api.ApiClient(cfg.agent_id, cfg.api_key)
     job = client.get_job(job_id)
     destination = job["destination"]
+    backup_type = job.get("backup_type", "files")
+    database_config = None
+    database_password: str | None = None
+    if backup_type == "database":
+        try:
+            database_config = postgresql.validate_source_config(job.get("source_config"))
+        except postgresql.PostgreSQLConfigError as exc:
+            print(f"Error: invalid PostgreSQL setup configuration: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        if job.get("source") is not None:
+            print("Error: database setup must not include a filesystem source.", file=sys.stderr)
+            raise SystemExit(1)
+        if postgresql.pg_dump_version() is None:
+            print(
+                "Error: pg_dump 9.0 or newer is required and must be available on PATH.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if not postgresql.probe_postgresql_support():
+            print(
+                "Error: PostgreSQL backups require Restic 0.17.0 or newer with "
+                "--stdin-from-command and --stdin-filename support.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        try:
+            existing_pgpass = postgresql.validate_pgpass_file(database_config)
+        except postgresql.PostgreSQLConfigError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        if existing_pgpass is None:
+            database_password = getpass.getpass("PostgreSQL database password: ")
+            confirm = getpass.getpass("Confirm PostgreSQL database password: ")
+            if not database_password or database_password != confirm:
+                print("Error: PostgreSQL passwords must be non-empty and match.", file=sys.stderr)
+                raise SystemExit(1)
+        print(
+            "Testing PostgreSQL connection "
+            f"(up to {postgresql.PG_CONNECTION_TIMEOUT_SECONDS} seconds)..."
+        )
+        pg_ok, pg_message = postgresql.test_connection(
+            database_config,
+            password=database_password,
+            password_file=existing_pgpass,
+        )
+        if not pg_ok:
+            print(f"Error: PostgreSQL connection test failed: {pg_message}", file=sys.stderr)
+            raise SystemExit(1)
+        print("PostgreSQL connection successful.")
+    elif backup_type != "files":
+        print("Error: unsupported backup type.", file=sys.stderr)
+        raise SystemExit(1)
     port = job.get("port")
     kind = _destination_kind(destination)
     fingerprint = credentials.destination_fingerprint(destination)
@@ -323,17 +377,20 @@ def run_setup(args: argparse.Namespace) -> None:
             f"Credentials for {destination} are already configured "
             f"({credentials.credentials_path()}) - skipping credential entry."
         )
-    elif kind == "sftp":
+    elif kind != "sftp":
+        prompted = _prompt_destination_credentials(destination)
+        env.update(prompted)
+
+    if kind == "sftp":
         # SFTP auth is SSH keys only; verify connectivity instead of prompting.
+        # Always probe, including when a repository password is already stored.
         _validate_sftp_destination(destination)
+        print("Testing SFTP SSH connection (20-second timeout)...")
         ok, stderr = _check_sftp_connectivity(destination, port)
         if not ok:
             _print_sftp_fix_commands(destination, port, stderr)
             raise SystemExit(1)
         print(f"SSH key authentication to {destination} verified.")
-    else:
-        prompted = _prompt_destination_credentials(destination)
-        env.update(prompted)
 
     # Probe/init needs a repo password. When none is known for this
     # destination (stored creds, restic.env, or process env), generate one for
@@ -344,7 +401,17 @@ def run_setup(args: argparse.Namespace) -> None:
         env["RESTIC_PASSWORD"] = secrets.token_urlsafe(32)
         password_generated = True
 
-    check = restic.check_repo(destination, env=env, port=port)
+    destination_label = {"s3": "S3", "b2": "B2", "sftp": "SFTP"}.get(kind, "repository")
+    print(
+        f"Testing {destination_label} repository connection "
+        f"(up to {restic.PROBE_TIMEOUT_SECONDS} seconds)..."
+    )
+    check = restic.check_repo(
+        destination,
+        env=env,
+        port=port,
+        timeout_seconds=restic.PROBE_TIMEOUT_SECONDS,
+    )
     if check.exists is None and password_generated:
         # A generated password cannot open an existing repository: ask for
         # the existing repo's password and re-probe (attach-existing-repo path).
@@ -354,7 +421,13 @@ def run_setup(args: argparse.Namespace) -> None:
         )
         env["RESTIC_PASSWORD"] = _prompt_password_twice()
         password_generated = False
-        check = restic.check_repo(destination, env=env, port=port)
+        print("Testing repository connection with the supplied repository password...")
+        check = restic.check_repo(
+            destination,
+            env=env,
+            port=port,
+            timeout_seconds=restic.PROBE_TIMEOUT_SECONDS,
+        )
     if check.exists is None:
         if check.timed_out:
             print(
@@ -367,13 +440,23 @@ def run_setup(args: argparse.Namespace) -> None:
         message = (
             check.stderr_tail or "Could not verify repository at destination."
         ) + agent._auth_failure_hint(check.stderr_tail, job_id)
+        message = agent._redact_secrets(message, env)
         print(f"Error: could not verify the repository at {destination}: {message}", file=sys.stderr)
         raise SystemExit(1)
 
     initialized_now = False
     if check.exists is False:
+        print(
+            f"Repository not initialized; initializing {destination} "
+            f"(up to {restic.PROBE_TIMEOUT_SECONDS} seconds)..."
+        )
         try:
-            result = restic.init_repo(destination, env=env, port=port)
+            result = restic.init_repo(
+                destination,
+                env=env,
+                port=port,
+                timeout_seconds=restic.PROBE_TIMEOUT_SECONDS,
+            )
         except FileNotFoundError:
             print(
                 "Error: restic executable not found on PATH. Install restic and try again.",
@@ -395,6 +478,7 @@ def run_setup(args: argparse.Namespace) -> None:
                 message = (result.stderr_tail or "Failed to initialize repository.") + (
                     agent._auth_failure_hint(result.stderr_tail, job_id)
                 )
+                message = agent._redact_secrets(message, env)
                 print(f"Error: restic init failed: {message}", file=sys.stderr)
                 raise SystemExit(1)
         else:
@@ -414,6 +498,21 @@ def run_setup(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             raise SystemExit(1)
+
+    if database_config is not None:
+        if database_password is not None:
+            try:
+                pgpass_file = postgresql.save_pgpass(database_config, database_password)
+            except (OSError, postgresql.PostgreSQLConfigError) as exc:
+                print(
+                    "Error: destination setup completed, but PostgreSQL credentials could not be "
+                    f"saved to {postgresql.pgpass_path(database_config)}: {exc}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            print(f"PostgreSQL credentials saved locally to {pgpass_file} (mode 0600).")
+        else:
+            print(f"PostgreSQL credentials are already configured in {postgresql.pgpass_path(database_config)}.")
 
     if initialized_now and password_generated:
         print()
@@ -449,6 +548,166 @@ def run_version(_args: argparse.Namespace) -> None:
 
 def run_update(args: argparse.Namespace) -> None:
     update.run_update(requested_version=args.version, check_only=args.check)
+
+
+def _prompt_value(label: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default is not None else ""
+    value = input(f"{label}{suffix}: ").strip()
+    return value or (default or "")
+
+
+def _prompt_yes_no(label: str, *, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    answer = input(f"{label} [{suffix}]: ").strip().lower()
+    if not answer:
+        return default
+    if answer in {"y", "yes"}:
+        return True
+    if answer in {"n", "no"}:
+        return False
+    raise hooks.HookCatalogError("Please answer yes or no.")
+
+
+def _toml_value(value: object) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(
+            f"{key} = {_toml_value(item)}" for key, item in value.items()
+        ) + " }"
+    raise TypeError(f"Cannot write {type(value).__name__} as a TOML value.")
+
+
+def _hook_entry_toml(entry: dict[str, object]) -> str:
+    lines = ["[[hooks]]"]
+    for key, value in entry.items():
+        lines.append(f"{key} = {_toml_value(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def run_hooks_add(_args: argparse.Namespace) -> None:
+    """Interactively append a validated hook definition to the local catalog."""
+    catalog_path = hooks.CATALOG_PATH
+    if catalog_path.is_symlink():
+        raise hooks.HookCatalogError("Hook catalog path must not be a symlink.")
+    catalog = hooks.load_catalog(catalog_path)
+
+    print("Add a locally installed executable to the Vecta hook catalog.")
+    print("The executable must already exist and be protected from untrusted modification.")
+    hook_id = _prompt_value("Hook ID")
+    name = _prompt_value("Display name")
+    description = _prompt_value("Description")
+    phase_choice = _prompt_value("Allowed phase (pre, post, both)").lower()
+    phase_map = {"pre": ["pre"], "post": ["post"], "both": ["pre", "post"]}
+    if phase_choice not in phase_map:
+        raise hooks.HookCatalogError("Phase must be pre, post, or both.")
+    executable = _prompt_value("Absolute executable path")
+
+    requires_root = _prompt_yes_no("Allow this hook to run as root?", default=False)
+    run_as = "root" if requires_root else _prompt_value("Run as account", "vecta-hook")
+
+    properties: dict[str, dict[str, str]] = {}
+    required: list[str] = []
+    print("Add parameters used by argv templates; leave the name blank when finished.")
+    while True:
+        parameter = _prompt_value("Parameter name (blank to finish)")
+        if not parameter:
+            break
+        kind = _prompt_value("Type (string, integer, boolean)", "string").lower()
+        if kind not in {"string", "integer", "boolean"}:
+            raise hooks.HookCatalogError("Parameter type must be string, integer, or boolean.")
+        properties[parameter] = {"type": kind}
+        if _prompt_yes_no(f"Is {parameter} required?", default=True):
+            required.append(parameter)
+
+    schema: dict[str, object] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = required
+    hooks._validate_schema(schema)
+
+    argv: list[str] = []
+    print("Add fixed argv items or whole-item placeholders such as ${target}.")
+    while True:
+        item = _prompt_value("argv item (blank to finish)")
+        if not item:
+            break
+        argv.append(item)
+
+    entry: dict[str, object] = {
+        "id": hook_id,
+        "name": name,
+        "description": description,
+        "phases": phase_map[phase_choice],
+        "executable": executable,
+        "argv": argv,
+        "parameters_schema": schema,
+        "run_as": run_as,
+        "requires_root": requires_root,
+    }
+    block = _hook_entry_toml(entry)
+
+    if hook_id in catalog:
+        raise hooks.HookCatalogError(f"Hook ID {hook_id!r} is already registered.")
+    catalog_path.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+    if not hooks._safe_root_controlled_directory(catalog_path.parent):
+        raise hooks.HookCatalogError("Hook catalog directory must be root-owned and not writable by group or others.")
+
+    existing = catalog_path.read_text(encoding="utf-8") if catalog_path.exists() else ""
+    contents = existing.rstrip() + ("\n\n" if existing.strip() else "") + block
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".hooks-", suffix=".toml", dir=catalog_path.parent
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as stream:
+            stream.write(contents)
+        os.chmod(temporary_path, 0o644)
+        # Validate the full updated catalog before replacing the installed one.
+        hooks.load_catalog(temporary_path)
+        os.replace(temporary_path, catalog_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    print(f"Registered hook {hook_id!r} in {catalog_path}.")
+    print("Run 'sudo vecta-agent hooks publish' to show it in the dashboard now.")
+
+
+def run_hooks_list(_args: argparse.Namespace) -> None:
+    catalog = hooks.load_catalog(hooks.CATALOG_PATH)
+    if not catalog:
+        print(f"No hooks registered in {hooks.CATALOG_PATH}.")
+        return
+    for hook_id in sorted(catalog):
+        definition = catalog[hook_id]
+        privilege = "root" if definition.requires_root else definition.run_as
+        print(f"{hook_id} — {definition.name} ({'/'.join(definition.phases)}, runs as {privilege})")
+
+
+def run_hooks_validate(_args: argparse.Namespace) -> None:
+    catalog = hooks.load_catalog(hooks.CATALOG_PATH)
+    print(f"Hook catalog is valid ({len(catalog)} hook{'s' if len(catalog) != 1 else ''}).")
+
+
+def run_hooks_publish(_args: argparse.Namespace) -> None:
+    cfg = config.load()
+    client = api.ApiClient(cfg.agent_id, cfg.api_key)
+    report = agent.capability_report()
+    client.report_capabilities(report)
+    hook_check = report["checks"]["hook_catalog_v1"]
+    if hook_check["status"] == "available":
+        print(f"Published {len(report['hooks'])} hook(s) and agent capabilities to Vecta.")
+    else:
+        print("Published agent capabilities; hooks are unavailable because the local catalog is invalid.")
 
 
 def _require_root(args: argparse.Namespace) -> None:
@@ -504,6 +763,17 @@ def main(argv: list[str] | None = None) -> None:
     setup_parser.add_argument("job_id", help="The job ID from the Vecta dashboard")
     setup_parser.set_defaults(func=run_setup)
 
+    hooks_parser = subparsers.add_parser("hooks", help="Manage the local hook catalog")
+    hooks_sub = hooks_parser.add_subparsers(dest="hooks_command", required=True)
+    hooks_add_parser = hooks_sub.add_parser("add", help="Interactively add a local hook")
+    hooks_add_parser.set_defaults(func=run_hooks_add)
+    hooks_list_parser = hooks_sub.add_parser("list", help="List locally registered hooks")
+    hooks_list_parser.set_defaults(func=run_hooks_list)
+    hooks_validate_parser = hooks_sub.add_parser("validate", help="Validate catalog entries and executable safety")
+    hooks_validate_parser.set_defaults(func=run_hooks_validate)
+    hooks_publish_parser = hooks_sub.add_parser("publish", help="Report capabilities to Vecta immediately")
+    hooks_publish_parser.set_defaults(func=run_hooks_publish)
+
     version_parser = subparsers.add_parser("version", help="Show version")
     version_parser.set_defaults(func=run_version)
 
@@ -525,11 +795,17 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     _setup_logging()
     try:
-        if args.command != "version":
+        is_read_only_hooks_command = (
+            args.command == "hooks" and args.hooks_command in {"list", "validate"}
+        )
+        if args.command != "version" and not is_read_only_hooks_command:
             _require_root(args)
         args.func(args)
     except SystemExit:
         raise
+    except hooks.HookCatalogError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
     except config.ConfigError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
