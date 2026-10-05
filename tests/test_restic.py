@@ -1,6 +1,8 @@
 import subprocess
 import threading
 import time
+import io
+from types import SimpleNamespace
 
 from vecta_agent import restic
 
@@ -59,6 +61,58 @@ class TestRepoOptions:
             "sftp:user@host:/path",
             "/src",
         ]
+
+    def test_stdin_runner_removes_ambient_pg_environment(self, monkeypatch):
+        captured = {}
+
+        class FakeProc:
+            stdout = io.StringIO("")
+            stderr = io.StringIO("")
+
+            def __init__(self, command, **kwargs):
+                captured["command"] = command
+                captured["env"] = kwargs["env"]
+
+        monkeypatch.setattr(restic, "os", SimpleNamespace(name="nt", environ={"PGPASSWORD": "ambient"}))
+        monkeypatch.setattr(restic.subprocess, "Popen", FakeProc)
+        runner = restic.ResticRunner(
+            None, "/repo", env={"PGPASSFILE": "/secure/pgpass"},
+            stdin_filename="postgresql-db.dump", source_command=["pg_dump", "--no-password"],
+            unset_env=("PGPASSWORD", "PGSERVICE"),
+        )
+        runner.start()
+        runner._stderr_thread.join(timeout=1)
+        assert captured["env"]["PGPASSFILE"] == "/secure/pgpass"
+        assert "PGPASSWORD" not in captured["env"]
+
+    def test_terminate_signals_process_group_and_reaps_direct_child(self, monkeypatch):
+        calls = []
+
+        class FakeProc:
+            pid = 1234
+            stdout = None
+            stderr = None
+            returncode = None
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("restic", timeout)
+                self.returncode = -9
+                return self.returncode
+
+        proc = FakeProc()
+        monkeypatch.setattr(restic, "os", SimpleNamespace(name="posix", killpg=lambda pid, sig: calls.append((pid, sig))))
+        monkeypatch.setattr(restic, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9))
+        runner = restic.ResticRunner("/src", "/repo")
+        runner._proc = proc
+        runner.terminate(grace_seconds=0.01)
+        assert calls == [(1234, 15), (1234, 9)]
+        assert proc.wait_calls == 2
+        assert proc.returncode == -9
 
     def test_check_repo_uses_port(self, monkeypatch):
         calls = []

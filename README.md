@@ -8,6 +8,8 @@ Stateless backup agent for the [Vecta](https://vectaapp.com) platform. Runs on L
 - **Single binary** — distributed as a standalone PyInstaller executable
 - **Auto-init repositories** — restic repos are initialized automatically on first backup
 - **Progress reporting** — live progress and cancellation support via cron-driven polling
+- **PostgreSQL backups** — streams custom-format `pg_dump` archives into Restic without staging a full dump file
+- **Local hooks** — root-controlled pre/post hook catalog with schema-validated parameters and bounded execution
 - **Secure by design** — repo passwords and cloud credentials stay on the machine, never sent to the backend
 
 ## Quick Start
@@ -62,26 +64,49 @@ pip install -e .
 |---------|-------------|
 | `sudo vecta-agent register --token <TOKEN>` | Register this machine with Vecta |
 | `sudo vecta-agent setup <JOB_ID>` | Store credentials for a job's destination and initialize its repository |
+| `sudo vecta-agent hooks add` | Interactively add a locally installed hook |
+| `vecta-agent hooks list` | List hooks in the local catalog |
+| `vecta-agent hooks validate` | Check catalog safety and hook definitions |
+| `sudo vecta-agent hooks publish` | Publish current capabilities to the dashboard immediately |
 | `sudo vecta-agent repo init <DEST>` | Initialize a restic repository at destination (manual escape hatch) |
 | `sudo vecta-agent run` | Execute due backup jobs (single pass) |
 | `vecta-agent version` | Show version |
-| `vecta-agent update` | Update the installed binary to the latest GitHub release (`--check` to compare only, `--version vX.Y.Z` to pin) |
+| `sudo vecta-agent update` | Update the installed binary to the latest GitHub release (`--check` to compare only, `--version vX.Y.Z` to pin) |
 
 ### Repository initialization
 
 ```bash
-vecta-agent setup <JOB_ID>                           # recommended: credentials + repo init
-vecta-agent repo init <DESTINATION>                  # prompts for password
-vecta-agent repo init <DESTINATION> --generate       # generates random password
-vecta-agent repo init <DESTINATION> --password <P>   # password on command line
-vecta-agent repo init <DESTINATION> --password-file <F>  # password from file
+sudo vecta-agent setup <JOB_ID>                              # recommended: credentials + repo init
+sudo vecta-agent repo init <DESTINATION>                     # prompts for password
+sudo vecta-agent repo init <DESTINATION> --generate          # generates random password
+sudo vecta-agent repo init <DESTINATION> --password <P>      # password on command line
+sudo vecta-agent repo init <DESTINATION> --password-file <F> # password from file
 ```
 
 The agent also auto-initializes missing repositories on `run` if a password is configured.
 
+### Local hooks
+
+Install the hook executable on the agent first, then run `sudo vecta-agent hooks add` to add
+it to `/etc/vecta/hooks.toml`. The wizard collects its metadata, allowed phase, execution
+account, parameters, and fixed argv template. Use `vecta-agent hooks validate` to check the
+catalog and `vecta-agent hooks list` to review it. Run `sudo vecta-agent hooks publish` to
+make the current catalog available in the dashboard immediately; otherwise the next
+`vecta-agent run` reports it automatically. Hook executables and the catalog must remain
+root-controlled. The default `vecta-hook` execution account must be provisioned locally, or
+select another existing service account in the wizard.
+
+PostgreSQL jobs require Restic 0.17.0+ and `pg_dump` 9.0+. `sudo vecta-agent setup <JOB_ID>`
+stores the database password in a connection-scoped mode-0600 pgpass file. The agent uses
+`pg_dump -Fc -Z 0` with Restic's `--stdin-from-command`; this avoids a full temporary dump
+file but does not eliminate Restic cache/upload disk use or promise a specific storage
+reduction. Database backups restore manually with `restic dump <snapshot> <stdin_filename>
+| pg_restore --dbname=<target>`. See [AGENT_USAGE.md](AGENT_USAGE.md#postgresql-database-jobs)
+for setup, restore, capability, and local hook catalog details.
+
 ### Root privileges
 
-On Linux, operational commands (`register`, `setup`, `repo init`, `run`, and `update`) must be
+On Linux, operational commands (`register`, `setup`, `hooks add`, `hooks publish`, `repo init`, `run`, and `update`) must be
 run as root so the agent can access the machine's backup data and system installation paths. Use
 `sudo vecta-agent ...`. For an intentional per-user invocation, pass `--allow-non-root` before
 the subcommand; this is an escape hatch and may prevent access to protected source paths.
@@ -140,7 +165,8 @@ The agent is designed to run from cron:
 ## Development
 
 ```bash
-pip install -e .[dev]
+pip install -e ".[dev]" pre-commit
+pre-commit install
 pytest -q
 ```
 

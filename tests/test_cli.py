@@ -1,8 +1,9 @@
+import json
 import subprocess
 
 import pytest
 
-from vecta_agent import __version__, api, cli, config, credentials, restic
+from vecta_agent import __version__, api, cli, config, credentials, postgresql, restic
 
 
 class FakeSetupClient:
@@ -20,6 +21,107 @@ class FakeSetupClient:
 
 
 class TestCli:
+    def test_hooks_add_writes_validated_entry_to_single_catalog(self, tmp_path, monkeypatch, capsys):
+        executable = tmp_path / "safe-hook"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        catalog_path = tmp_path / "etc" / "vecta" / "hooks.toml"
+        monkeypatch.setattr(cli.hooks, "CATALOG_PATH", catalog_path)
+        answers = iter([
+            "safe-cleanup", "Safe cleanup", "Clean a selected temporary marker.",
+            "pre", str(executable), "n", "", "target", "string", "y", "",
+            "--target", "${target}", "",
+        ])
+        monkeypatch.setattr("builtins.input", lambda *_args: next(answers))
+
+        cli.main(["--allow-non-root", "hooks", "add"])
+
+        catalog = cli.hooks.load_catalog(catalog_path)
+        assert list(catalog) == ["safe-cleanup"]
+        assert catalog["safe-cleanup"].argv == ("--target", "${target}")
+        assert catalog["safe-cleanup"].parameters_schema["required"] == ["target"]
+        assert "Registered hook 'safe-cleanup'" in capsys.readouterr().out
+
+    def test_hooks_validate_and_list_show_local_catalog(self, tmp_path, monkeypatch, capsys):
+        executable = tmp_path / "safe-hook"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        catalog_path = tmp_path / "hooks.toml"
+        catalog_path.write_text(
+            f'''[[hooks]]
+id = "safe-cleanup"
+name = "Safe cleanup"
+description = "Clean a selected temporary marker."
+phases = ["pre"]
+executable = {json.dumps(str(executable))}
+argv = []
+run_as = "vecta-hook"
+requires_root = false
+''',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(cli.hooks, "CATALOG_PATH", catalog_path)
+
+        cli.main(["hooks", "validate"])
+        cli.main(["hooks", "list"])
+
+        output = capsys.readouterr().out
+        assert "Hook catalog is valid (1 hook)." in output
+        assert "safe-cleanup — Safe cleanup (pre, runs as vecta-hook)" in output
+
+    def test_hooks_publish_sends_complete_agent_capability_report(self, monkeypatch, capsys):
+        report = {
+            "features": ["hook_catalog_v1", "postgresql_stdin_backup"],
+            "hooks": [{"id": "safe-cleanup"}],
+            "checks": {
+                "hook_catalog_v1": {"status": "available"},
+                "postgresql_stdin_backup": {"status": "available"},
+            },
+        }
+        calls = []
+
+        class FakeClient:
+            def __init__(self, agent_id, api_key):
+                assert (agent_id, api_key) == ("a1", "api-key")
+
+            def report_capabilities(self, payload):
+                calls.append(payload)
+
+        monkeypatch.setattr(cli.config, "load", lambda: config.Config("a1", "api-key"))
+        monkeypatch.setattr(cli.agent, "capability_report", lambda: report)
+        monkeypatch.setattr(cli.api, "ApiClient", FakeClient)
+
+        cli.main(["--allow-non-root", "hooks", "publish"])
+
+        assert calls == [report]
+        assert "Published 1 hook(s) and agent capabilities" in capsys.readouterr().out
+
+    def test_database_setup_saves_scoped_pgpass_without_touching_dest_credentials(self, tmp_config_dir, monkeypatch, capsys):
+        make_config(tmp_config_dir)
+        (tmp_config_dir / "restic.env").write_text("RESTIC_PASSWORD=repo-only\n", encoding="utf-8")
+        job = {
+            "job_id": "db-setup", "backup_type": "database", "source": None,
+            "source_config": {
+                "engine": "postgresql", "host": "db.internal", "port": 5432,
+                "database": "orders", "username": "backup", "ssl_mode": "require", "dump_format": "custom",
+            },
+            "destination": "/repo",
+        }
+        monkeypatch.setattr(cli.api, "ApiClient", lambda *a, **kw: FakeSetupClient(job))
+        monkeypatch.setattr(postgresql, "pg_dump_version", lambda: (16, 0))
+        monkeypatch.setattr(postgresql, "probe_postgresql_support", lambda: True)
+        monkeypatch.setattr(postgresql, "test_connection", lambda *a, **kw: (True, ""))
+        prompts = iter(["db-secret", "db-secret"])
+        monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: next(prompts))
+        monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))
+
+        cli.run_setup(type("Args", (), {"job_id": "db-setup"})())
+
+        path = postgresql.pgpass_path(job["source_config"])
+        assert path.exists()
+        assert "db-secret" in path.read_text(encoding="utf-8")
+        assert "repo-only" not in path.read_text(encoding="utf-8")
+        assert "db-secret" not in credentials.credentials_path().read_text(encoding="utf-8")
+        assert "PostgreSQL credentials saved locally" in capsys.readouterr().out
+
     def test_operational_commands_require_root_on_posix(self, monkeypatch):
         monkeypatch.setattr(cli, "_IS_POSIX", True)
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
@@ -297,7 +399,7 @@ class TestSetup:
             cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(False)
         )
 
-        def fake_init(destination, env=None, port=None):
+        def fake_init(destination, env=None, port=None, **kwargs):
             init_env.update(env or {})
             return restic.ResticResult(exit_code=0)
 
@@ -334,7 +436,6 @@ class TestSetup:
 
         cli.main(["setup", "j1"])
 
-        out = capsys.readouterr().out
         assert len(prompts) == 3
         assert all("Type SAVED" in p for p in prompts)
         assert credentials.load_credentials(credentials.destination_fingerprint(dest))
@@ -372,7 +473,6 @@ class TestSetup:
         dest = "/backups/data"
         self._install_client(monkeypatch, {"job_id": "j1", "source": "/src", "destination": dest})
 
-        probe_env = {}
         monkeypatch.setattr(cli.restic, "check_repo", lambda *a, **kw: restic.RepoCheck(True))
         monkeypatch.setattr(
             cli.restic,

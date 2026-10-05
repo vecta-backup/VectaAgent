@@ -9,8 +9,7 @@ import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger("vecta_agent")
@@ -52,39 +51,56 @@ class ResticRunner:
 
     def __init__(
         self,
-        source: str,
+        source: str | None,
         destination: str,
         port: int | None = None,
         env: dict[str, str] | None = None,
+        stdin_filename: str | None = None,
+        source_command: list[str] | None = None,
+        unset_env: tuple[str, ...] = (),
     ) -> None:
         self.source = source
         self.destination = destination
         self.port = port
         self.env = env or {}
+        self.stdin_filename = stdin_filename
+        self.source_command = list(source_command) if source_command is not None else None
+        self.unset_env = tuple(unset_env)
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._stderr_thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     def _build_cmd(self) -> list[str]:
-        return [
+        command = [
             "restic",
             "backup",
             "--json",
             *repo_options(self.destination, self.port),
             "--repo",
             self.destination,
-            self.source,
         ]
+        if self.source_command is not None:
+            if not self.stdin_filename:
+                raise ValueError("stdin_filename is required for command-backed stdin backups")
+            command += ["--stdin-from-command", "--stdin-filename", self.stdin_filename, "--", *self.source_command]
+        else:
+            if not self.source:
+                raise ValueError("source path is required for filesystem backups")
+            command.append(self.source)
+        return command
 
     def start(self) -> None:
         env = {**os.environ, **self.env}
+        for key in self.unset_env:
+            env.pop(key, None)
         self._proc = subprocess.Popen(
             self._build_cmd(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            start_new_session=(os.name == "posix"),
         )
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
@@ -111,21 +127,30 @@ class ResticRunner:
             yield obj
 
     def terminate(self, grace_seconds: float = 10.0) -> None:
-        """Send SIGTERM, then SIGKILL after grace."""
+        """Signal the process group, escalate, and reap Restic."""
         proc = self._proc
         if proc is None:
             return
         try:
-            proc.terminate()
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGTERM)
+            else:
+                proc.terminate()
         except ProcessLookupError:
-            return
+            pass
         try:
             proc.wait(timeout=grace_seconds)
         except subprocess.TimeoutExpired:
             try:
-                proc.kill()
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
             except ProcessLookupError:
                 pass
+            proc.wait()
+        if self._proc.stderr is not None and self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2.0)
 
     def wait(self) -> int:
         """Wait for the process to finish and return exit code."""
@@ -201,12 +226,13 @@ def run_restic(
         stderr=subprocess.PIPE,
         text=True,
         env=full_env,
+        start_new_session=(os.name == "posix"),
     )
     if cancel_event is None:
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_process_group(proc)
             proc.communicate()  # reap the killed process
             return _timeout_result(args, timeout_seconds)
         return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
@@ -215,7 +241,7 @@ def run_restic(
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            proc.kill()
+            _kill_process_group(proc)
             proc.communicate()  # reap the killed process
             return _timeout_result(args, timeout_seconds)
         try:
@@ -225,7 +251,7 @@ def run_restic(
             return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
         except subprocess.TimeoutExpired:
             if cancel_event.is_set():
-                proc.kill()
+                _kill_process_group(proc)
                 proc.communicate()  # reap the killed process
                 return ResticResult(
                     exit_code=130,
@@ -240,6 +266,16 @@ def _timeout_result(args: list[str], timeout_seconds: int) -> ResticResult:
         stderr_tail=f"restic {args[0]} timed out after {timeout_seconds}s and was killed",
         timed_out=True,
     )
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 class RepoCheck:
