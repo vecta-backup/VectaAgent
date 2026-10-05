@@ -24,7 +24,7 @@ parameters_schema = {{ type = "object", properties = {{ target = {{ type = "stri
 {extra}'''
 
 
-def test_catalog_exposes_safe_metadata_without_paths(tmp_path, monkeypatch):
+def test_catalog_exposes_safe_metadata_without_paths(tmp_path, monkeypatch, mock_hook_account):
     executable = tmp_path / "hook"
     executable.write_text("trusted local executable")
     catalog_path = tmp_path / "hooks.toml"
@@ -64,7 +64,9 @@ def test_catalog_pattern_schema_is_supported_and_bounded():
         })
 
 
-def test_catalog_rejects_duplicate_ids_and_unsafe_paths(tmp_path, monkeypatch):
+def test_catalog_rejects_duplicate_ids_and_unsafe_paths(
+    tmp_path, monkeypatch, mock_hook_account
+):
     executable = tmp_path / "hook"
     executable.touch()
     catalog_path = tmp_path / "hooks.toml"
@@ -139,7 +141,9 @@ class _FakeProcess:
         self.returncode = -9
 
 
-def test_execution_is_argv_only_has_clean_environment_and_bounds_output(monkeypatch):
+def test_execution_is_argv_only_has_clean_environment_and_bounds_output(
+    monkeypatch, mock_hook_account
+):
     captured = {}
 
     def fake_popen(argv, **kwargs):

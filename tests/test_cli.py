@@ -21,11 +21,15 @@ class FakeSetupClient:
 
 
 class TestCli:
-    def test_hooks_add_writes_validated_entry_to_single_catalog(self, tmp_path, monkeypatch, capsys):
+    def test_hooks_add_writes_validated_entry_to_single_catalog(
+        self, tmp_path, monkeypatch, capsys, mock_hook_account
+    ):
         executable = tmp_path / "safe-hook"
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         catalog_path = tmp_path / "etc" / "vecta" / "hooks.toml"
         monkeypatch.setattr(cli.hooks, "CATALOG_PATH", catalog_path)
+        monkeypatch.setattr(cli.hooks, "_safe_root_controlled_directory", lambda *_: True)
+        monkeypatch.setattr(cli.hooks, "_safe_root_controlled_path", lambda *_a, **_kw: True)
         answers = iter([
             "safe-cleanup", "Safe cleanup", "Clean a selected temporary marker.",
             "pre", str(executable), "n", "", "target", "string", "y", "",
@@ -41,7 +45,9 @@ class TestCli:
         assert catalog["safe-cleanup"].parameters_schema["required"] == ["target"]
         assert "Registered hook 'safe-cleanup'" in capsys.readouterr().out
 
-    def test_hooks_validate_and_list_show_local_catalog(self, tmp_path, monkeypatch, capsys):
+    def test_hooks_validate_and_list_show_local_catalog(
+        self, tmp_path, monkeypatch, capsys, mock_hook_account
+    ):
         executable = tmp_path / "safe-hook"
         executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         catalog_path = tmp_path / "hooks.toml"
@@ -59,6 +65,7 @@ requires_root = false
             encoding="utf-8",
         )
         monkeypatch.setattr(cli.hooks, "CATALOG_PATH", catalog_path)
+        monkeypatch.setattr(cli.hooks, "_safe_root_controlled_path", lambda *_a, **_kw: True)
 
         cli.main(["hooks", "validate"])
         cli.main(["hooks", "list"])

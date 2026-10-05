@@ -202,6 +202,7 @@ class TestRunRestic:
                 killed.append(True)
 
         monkeypatch.setattr(restic.subprocess, "Popen", HangingProc)
+        monkeypatch.setattr(restic, "_kill_process_group", lambda proc: proc.kill())
         result = restic.run_restic(["cat", "config", "--repo", "r"], timeout_seconds=3)
         assert killed == [True]
         assert result.timed_out is True
@@ -228,6 +229,7 @@ class TestRunRestic:
                 killed.append(True)
 
         monkeypatch.setattr(restic.subprocess, "Popen", CancellableProc)
+        monkeypatch.setattr(restic, "_kill_process_group", lambda proc: proc.kill())
         result = restic.run_restic(["cat", "config", "--repo", "r"], cancel_event=event)
         assert killed == [True]
         assert result.cancelled is True
@@ -254,6 +256,7 @@ class TestRunRestic:
                 killed.append(True)
 
         monkeypatch.setattr(restic.subprocess, "Popen", HangingProc)
+        monkeypatch.setattr(restic, "_kill_process_group", lambda proc: proc.kill())
         result = restic.run_restic(
             ["cat", "config", "--repo", "r"],
             timeout_seconds=0.3,
