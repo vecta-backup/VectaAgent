@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import re
 import tempfile
@@ -29,7 +30,7 @@ MAX_STAGE_RESULTS = 8
 MAX_STAGE_MESSAGE_CHARS = 500
 STAGE_RESULT_STAGES = frozenset({
     "repository", "validation", "pipeline", "pre_hook", "source_capture",
-    "database_dump", "restic", "post_hook",
+    "database_dump", "restic", "post_hook", "prune",
 })
 STAGE_RESULT_STATUSES = frozenset({"success", "failed", "skipped", "cancelled", "warning"})
 _SECRET_ENV_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "ACCESS_KEY", "ACCOUNT_KEY", "CREDENTIAL", "AUTH")
@@ -111,6 +112,35 @@ class JobLock:
         self.release()
 
 
+class RepositoryLock(JobLock):
+    """Best-effort lock shared by local jobs targeting the same repository."""
+
+    def __init__(self, destination: str) -> None:
+        digest = hashlib.sha256(destination.strip().encode("utf-8")).hexdigest()
+        self.path = Path(tempfile.gettempdir()) / f"vecta-repo-{digest}.lock"
+        self._fd = None
+
+
+class RunLocks:
+    """Hold the per-job and repository locks for a complete job lifecycle."""
+
+    def __init__(self, job_id: str, destination: str) -> None:
+        self.job_lock = JobLock(job_id)
+        self.repository_lock = RepositoryLock(destination)
+
+    def acquire(self) -> bool:
+        if not self.job_lock.acquire():
+            return False
+        if not self.repository_lock.acquire():
+            self.job_lock.release()
+            return False
+        return True
+
+    def release(self) -> None:
+        self.repository_lock.release()
+        self.job_lock.release()
+
+
 def load_restic_env(config_dir: Path) -> dict[str, str]:
     """Load optional key=value restic.env file."""
     env_path = config_dir / "restic.env"
@@ -186,6 +216,49 @@ def _redact_secrets(message: str, env: dict[str, str] | None) -> str:
         if value and any(marker in key.upper() for marker in _SECRET_ENV_MARKERS):
             result = result.replace(value, "[REDACTED]")
     return result[:MAX_STAGE_MESSAGE_CHARS]
+
+
+def _validate_job_storage_config(job: dict[str, Any], backup_type: str) -> tuple[list[str], dict[str, int | None] | None]:
+    excludes = restic.validate_exclude_patterns(job.get("exclude_patterns", []))
+    if backup_type == "database" and excludes:
+        raise ValueError("Database jobs cannot use filesystem exclude patterns.")
+    policy = restic.validate_retention_policy(job.get("retention_policy"))
+    return excludes, policy
+
+
+def _run_prune(
+    destination: str,
+    port: int | None,
+    env: dict[str, str],
+    policy: dict[str, int | None] | None,
+    cancel_event: threading.Event,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Run configured post-snapshot pruning and return stage plus safe message."""
+    if policy is None:
+        return None, None
+    started = time.monotonic()
+    try:
+        result = restic.run_forget(
+            destination, policy, port=port, env=env, cancel_event=cancel_event,
+        )
+    except FileNotFoundError:
+        result = restic.ResticResult(127, stderr_tail="Restic executable not found on PATH.")
+    except Exception:
+        result = restic.ResticResult(1, stderr_tail="Restic pruning could not be completed safely.")
+    duration = int(time.monotonic() - started)
+    if result.exit_code == 0 and not result.cancelled and not result.timed_out:
+        message = result.recovery_message
+        return _stage_result("prune", "success", 0, duration, _redact_secrets(message, env) if message else None), None
+    if result.cancelled:
+        reason = "Pruning was cancelled after the snapshot was committed."
+    elif result.timed_out:
+        reason = f"Pruning timed out after {restic.PRUNE_TIMEOUT_SECONDS}s."
+    else:
+        reason = result.stderr_tail or f"Restic forget --prune exited with code {result.exit_code}."
+    if result.recovery_message:
+        reason = f"{reason} {result.recovery_message}"
+    safe_message = _redact_secrets(reason, env)
+    return _stage_result("prune", "failed", result.exit_code, duration, safe_message), safe_message
 
 
 def _progress_reporter(
@@ -322,6 +395,96 @@ def _timeout_watchdog(
     logger.warning("Job exceeded the maximum duration; terminating restic. %s", _timeout_message())
 
 
+def _retry_backup_after_lock(
+    runner_factory: Any,
+    stderr: str,
+    destination: str,
+    port: int | None,
+    env: dict[str, str],
+    client: api.ApiClient,
+    job_id: str,
+    run_id: str,
+    start_time: float,
+    cancel_event: threading.Event,
+    terminator: _JobTerminator,
+    metadata: dict[str, Any],
+) -> tuple[restic.ResticRunner | None, dict[str, Any], int | None, bool, bool, bool, str | None]:
+    """Unlock a detected stale lock and retry one backup exactly once."""
+    if not restic.is_repository_lock_error(stderr) or cancel_event.is_set():
+        return None, {}, None, False, False, False, None
+    try:
+        unlock = restic.unlock_repo(destination, port=port, env=env, cancel_event=cancel_event)
+    except Exception:
+        return None, {}, None, False, False, False, "Lock recovery: unlock could not be started safely."
+    recovery = f"Lock recovery: unlock exited {unlock.exit_code}."
+    if unlock.exit_code != 0 or unlock.timed_out or unlock.cancelled:
+        details = _redact_secrets(unlock.stderr_tail, env) if unlock.stderr_tail else ""
+        return None, {}, None, unlock.timed_out, unlock.cancelled, False, f"{recovery} {details}".strip()
+
+    try:
+        retry_runner = runner_factory()
+        retry_runner.start()
+    except Exception:
+        return None, {}, 1, False, False, False, f"{recovery} Backup retry could not be started."
+    terminator.set_runner(retry_runner)
+    stats: dict[str, Any] = {"stage": "restic"}
+    attempt_done = threading.Event()
+    timeout_event = threading.Event()
+    progress_thread = threading.Thread(
+        target=_progress_reporter,
+        args=(client, job_id, run_id, start_time, stats, attempt_done, metadata),
+        daemon=True,
+    )
+    timeout_thread = threading.Thread(
+        target=_timeout_watchdog,
+        args=(retry_runner, timeout_event, attempt_done),
+        daemon=True,
+    )
+    cancel_done = threading.Event()
+    cancel_thread = threading.Thread(
+        target=_cancel_poller,
+        args=(client, job_id, cancel_event, cancel_done, terminator),
+        daemon=True,
+    )
+    progress_thread.start()
+    timeout_thread.start()
+    cancel_thread.start()
+    stream_error = False
+    try:
+        for obj in retry_runner.stream():
+            if obj.get("message_type") == "status":
+                stats["progress"] = restic.compute_progress(obj)
+                if isinstance(obj.get("files_done"), int):
+                    stats["files_processed"] = obj["files_done"]
+                if isinstance(obj.get("bytes_done"), int):
+                    stats["bytes_processed"] = obj["bytes_done"]
+            elif obj.get("message_type") == "summary":
+                stats.update(restic.parse_summary(obj))
+                stats["_summary_seen"] = True
+    except Exception:
+        stream_error = True
+    try:
+        exit_code = retry_runner.wait()
+    except Exception:
+        exit_code = 1
+        stream_error = True
+    attempt_done.set()
+    cancel_done.set()
+    progress_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
+    timeout_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
+    cancel_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
+    stats.pop("progress", None)
+    return (
+        retry_runner,
+        stats,
+        exit_code,
+        timeout_event.is_set(),
+        cancel_event.is_set(),
+        stream_error,
+        f"{recovery} Retry exited {exit_code}.",
+    )
+
+
 def _report_cancelled(
     client: api.ApiClient,
     job_id: str,
@@ -405,7 +568,7 @@ def _run_files_job(
     # the same job can never be conflated into one log entry.
     run_id = uuid.uuid4().hex
 
-    lock = JobLock(job_id)
+    lock = RunLocks(job_id, destination)
     if not lock.acquire():
         return
 
@@ -417,6 +580,17 @@ def _run_files_job(
     status_metadata = {"backup_type": "files", "stdin_filename": None}
 
     try:
+        try:
+            excludes, retention_policy = _validate_job_storage_config(job, "files")
+        except ValueError as exc:
+            message = str(exc)[:MAX_STAGE_MESSAGE_CHARS]
+            client.report_status(job_id, {
+                "job_id": job_id, "run_id": run_id, "status": "failed",
+                **status_metadata, "stage": "validation", "exit_code": 1,
+                "message": message,
+                "stage_results": [_stage_result("validation", "failed", 1, None, message)],
+            })
+            return
         client.report_status(
             job_id,
             {"job_id": job_id, "run_id": run_id, "status": "running", "stage": "restic", **status_metadata},
@@ -546,7 +720,8 @@ def _run_files_job(
             logger.error("Job %s failed: restic binary not found in PATH.", job_id)
             return
 
-        runner = restic.ResticRunner(source, destination, port=port, env=job_env)
+        runner_args = {"exclude_patterns": excludes} if excludes else {}
+        runner = restic.ResticRunner(source, destination, port=port, env=job_env, **runner_args)
         try:
             runner.start()
         except FileNotFoundError:
@@ -611,6 +786,29 @@ def _run_files_job(
 
         duration = int(time.monotonic() - start_time)
 
+        recovery_note = None
+        if exit_code != 0 and not timeout_event.is_set() and not cancel_event.is_set():
+            retry_values = _retry_backup_after_lock(
+                lambda: restic.ResticRunner(
+                    source, destination, port=port, env=job_env,
+                    **({"exclude_patterns": excludes} if excludes else {}),
+                ),
+                runner.stderr_tail(), destination, port, job_env, client, job_id,
+                run_id, start_time, cancel_event, terminator, status_metadata,
+            )
+            retry_runner, retry_stats, retry_code, retry_timed_out, retry_cancelled, _retry_stream_error, recovery_note = retry_values
+            if retry_runner is not None:
+                runner = retry_runner
+                stats.clear()
+                stats.update(retry_stats)
+                exit_code = retry_code if retry_code is not None else 1
+                if retry_timed_out:
+                    timeout_event.set()
+                if retry_cancelled:
+                    cancel_event.set()
+            if retry_runner is not None:
+                logger.info("Job %s %s", job_id, recovery_note)
+
         if cancel_event.is_set():
             _report_cancelled(client, job_id, run_id, start_time, status_metadata)
             return
@@ -638,14 +836,20 @@ def _run_files_job(
             # checks only total files processed, and only when restic's
             # summary event actually reported it.
             zero_files = bool(stats.get("_summary_seen")) and stats.get("files_processed") == 0
+            stage_results = [_stage_result("restic", "success", 0, duration, _redact_secrets(recovery_note, job_env) if recovery_note else None)]
+            prune_message = None
+            if retention_policy is not None and stats.get("_summary_seen") and stats.get("snapshot_id"):
+                prune_stage, prune_message = _run_prune(destination, port, job_env, retention_policy, cancel_event)
+                if prune_stage is not None:
+                    stage_results.append(prune_stage)
             payload = {
                 "job_id": job_id,
                 "run_id": run_id,
-                "status": "warning" if zero_files else "success",
+                "status": "warning" if zero_files or prune_message else "success",
                 **status_metadata,
                 "stage": "restic",
                 "exit_code": 0,
-                "message": (
+                "message": prune_message or (
                     "Backup completed but no files were processed. The source "
                     "path may be empty, missing, or wrong — check the job's "
                     "source path."
@@ -657,10 +861,12 @@ def _run_files_job(
                 "files_processed": stats.get("files_processed"),
                 "bytes_processed": stats.get("bytes_processed"),
                 "transferred_bytes": stats.get("transferred_bytes"),
-                "stage_results": [{"stage": "restic", "status": "success", "exit_code": 0, "duration_seconds": duration, "message": None}],
+                "stage_results": stage_results[-MAX_STAGE_RESULTS:],
             }
             client.report_status(job_id, payload)
-            if zero_files:
+            if prune_message:
+                logger.warning("Job %s completed with pruning warning: %s", job_id, prune_message)
+            elif zero_files:
                 logger.warning("Job %s completed with no files processed.", job_id)
             else:
                 logger.info("Job %s succeeded (snapshot %s).", job_id, stats.get("snapshot_id"))
@@ -673,9 +879,10 @@ def _run_files_job(
                 "stage": "restic",
                 "exit_code": exit_code,
                 "message": _redact_secrets((runner.stderr_tail() or f"restic exited with code {exit_code}")
+                + (f" {recovery_note}" if recovery_note else "")
                 + _auth_failure_hint(runner.stderr_tail(), job_id), job_env),
                 "duration_seconds": duration,
-                "stage_results": [{"stage": "restic", "status": "failed", "exit_code": exit_code, "duration_seconds": duration, "message": _redact_secrets(runner.stderr_tail() or f"restic exited with code {exit_code}", job_env)}],
+                "stage_results": [_stage_result("restic", "failed", exit_code, duration, _redact_secrets((runner.stderr_tail() or f"restic exited with code {exit_code}") + (f" {recovery_note}" if recovery_note else ""), job_env))],
             }
             client.report_status(job_id, payload)
             logger.error("Job %s failed with exit code %s.", job_id, exit_code)
@@ -722,7 +929,7 @@ def _run_pipeline_job(
     metadata: dict[str, Any] = {"backup_type": backup_type if backup_type in {"files", "database"} else "files", "stdin_filename": None}
     destination = job.get("destination")
     port = job.get("port")
-    lock = JobLock(job_id)
+    lock = RunLocks(job_id, destination if isinstance(destination, str) else "")
     if not lock.acquire():
         return
     start_time = time.monotonic()
@@ -746,7 +953,7 @@ def _run_pipeline_job(
             **metadata,
             "stage_results": stage_results[-MAX_STAGE_RESULTS:],
         }
-        if stage in {"pre_hook", "source_capture", "database_dump", "restic", "post_hook"}:
+        if stage in {"validation", "pre_hook", "source_capture", "database_dump", "restic", "post_hook", "prune"}:
             payload["stage"] = stage
         elif stage == "repository":
             payload["stage"] = "restic"
@@ -761,6 +968,7 @@ def _run_pipeline_job(
 
         if backup_type not in {"files", "database"}:
             raise ValueError("backup_type must be files or database.")
+        excludes, retention_policy = _validate_job_storage_config(job, backup_type)
         if not isinstance(destination, str) or not destination:
             raise ValueError("destination is required.")
         if backup_type == "files":
@@ -910,7 +1118,8 @@ def _run_pipeline_job(
                     unset_env=postgresql.PG_ENV_UNSET,
                 )
             else:
-                runner = restic.ResticRunner(source, destination, port=port, env=run_env)
+                runner_args = {"exclude_patterns": excludes} if excludes else {}
+                runner = restic.ResticRunner(source, destination, port=port, env=run_env, **runner_args)
             try:
                 runner.start()
             except FileNotFoundError:
@@ -957,6 +1166,39 @@ def _run_pipeline_job(
                     progress_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
                     timeout_thread.join(timeout=CANCEL_INTERVAL_SECONDS + 2)
                 duration = int(time.monotonic() - stage_started)
+                recovery_note = None
+                if exit_code != 0 and not stream_error and not timeout_event.is_set() and not cancel_event.is_set():
+                    def make_runner():
+                        if backup_type == "database":
+                            return restic.ResticRunner(
+                                None, destination, port=port, env=run_env,
+                                stdin_filename=stdin_name,
+                                source_command=postgresql.build_pg_dump_argv(source_config),
+                                unset_env=postgresql.PG_ENV_UNSET,
+                            )
+                        return restic.ResticRunner(
+                            source, destination, port=port, env=run_env,
+                            **({"exclude_patterns": excludes} if excludes else {}),
+                        )
+
+                    retry = _retry_backup_after_lock(
+                        make_runner, runner.stderr_tail(), destination, port, run_env,
+                        client, job_id, run_id, start_time, cancel_event, terminator, metadata,
+                    )
+                    retry_runner, retry_stats, retry_code, retry_timeout, retry_cancelled, retry_stream_error, recovery_note = retry
+                    if retry_runner is not None:
+                        runner = retry_runner
+                        stats.clear()
+                        stats.update(retry_stats)
+                        exit_code = retry_code if retry_code is not None else 1
+                        stream_error = retry_stream_error
+                        if retry_timeout:
+                            timeout_event.set()
+                        if retry_cancelled:
+                            cancel_event.set()
+                        snapshot_stats.clear()
+                    if recovery_note:
+                        logger.info("Job %s %s", job_id, recovery_note)
                 snapshot_stats.update({key: value for key, value in stats.items() if not key.startswith("_") and key not in {"stage", "progress"}})
                 if stream_error:
                     primary_failure = (exit_code if exit_code else 1, stage, "Restic progress stream failed; backup outcome is unverified.")
@@ -969,9 +1211,9 @@ def _run_pipeline_job(
                     primary_failure = (124, stage, _timeout_message())
                     stage_results.append(_stage_result(stage, "failed", 124, duration, _timeout_message()))
                 elif exit_code == 0:
-                    stage_results.append(_stage_result(stage, "success", 0, duration))
+                    stage_results.append(_stage_result(stage, "success", 0, duration, _redact_secrets(recovery_note, run_env) if recovery_note else None))
                     if backup_type == "database":
-                        stage_results.append(_stage_result("restic", "success", 0, duration))
+                        stage_results.append(_stage_result("restic", "success", 0, duration, _redact_secrets(recovery_note, run_env) if recovery_note else None))
                 else:
                     stderr = runner.stderr_tail()
                     producer_status = re.search(r"failed:\s*exit status\s+(\d+)", stderr, re.IGNORECASE)
@@ -980,7 +1222,7 @@ def _run_pipeline_job(
                         stage_results.append(_stage_result("restic", "failed", exit_code, duration, "Restic rejected the failed pg_dump stream."))
                         primary_failure = (exit_code, "source_capture", "pg_dump failed; Restic did not create a snapshot.")
                     else:
-                        msg = _redact_secrets((stderr or f"Restic exited with code {exit_code}") + _auth_failure_hint(stderr, job_id), run_env)
+                        msg = _redact_secrets((stderr or f"Restic exited with code {exit_code}") + (f" {recovery_note}" if recovery_note else "") + _auth_failure_hint(stderr, job_id), run_env)
                         stage_results.append(_stage_result("restic", "failed", exit_code, duration, msg))
                         primary_failure = (exit_code, "restic", msg)
                     # Never trust a snapshot summary when Restic reports failure.
@@ -1024,6 +1266,16 @@ def _run_pipeline_job(
                 if failed and primary_failure is None:
                     primary_failure = (130 if result.cancelled else 124 if result.timed_out else result.exit_code, "post_hook", message or "Post-hook failed.")
 
+        prune_message: str | None = None
+        backup_committed = bool(snapshot_stats.get("snapshot_id")) and any(
+            result["stage"] in {"restic", "source_capture"} and result["status"] == "success"
+            for result in stage_results
+        )
+        if backup_committed and retention_policy is not None:
+            prune_stage, prune_message = _run_prune(destination, port, job_env, retention_policy, cancel_event)
+            if prune_stage is not None:
+                stage_results.append(prune_stage)
+
         if primary_failure is not None:
             code, failed_stage, message = primary_failure
             report_terminal("failed", code, message, failed_stage)
@@ -1042,9 +1294,11 @@ def _run_pipeline_job(
                 result["stage"] == "restic" and result["status"] == "success"
                 for result in stage_results
             ) and snapshot_stats.get("files_processed") == 0
-            message = "Backup completed but no files were processed. Check the source path." if zero_files else "Backup completed"
-            report_terminal("warning" if zero_files else "success", 0, message, "post_hook" if post_selection else ("source_capture" if backup_type == "database" else "restic"))
-            if zero_files:
+            message = prune_message or ("Backup completed but no files were processed. Check the source path." if zero_files else "Backup completed")
+            report_terminal("warning" if zero_files or prune_message else "success", 0, message, "prune" if prune_message else ("post_hook" if post_selection else ("source_capture" if backup_type == "database" else "restic")))
+            if prune_message:
+                logger.warning("Job %s completed with pruning warning: %s", job_id, prune_message)
+            elif zero_files:
                 logger.warning("Job %s completed with no files processed.", job_id)
             else:
                 logger.info("Job %s succeeded (snapshot %s).", job_id, snapshot_stats.get("snapshot_id"))

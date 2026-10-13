@@ -950,3 +950,13 @@ class TestJobLock:
         assert agent._safe_lock_name("a/b") == "a_b"
         assert agent._safe_lock_name("job-1") == "job-1"
         assert agent._safe_lock_name("") == ""
+
+    def test_repository_lock_uses_stable_destination_digest(self):
+        first = agent.RepositoryLock("  s3:https://user:secret@example/repo  ")
+        second = agent.RepositoryLock("s3:https://user:secret@example/repo")
+        other = agent.RepositoryLock("s3:https://other/repo")
+        assert first.path == second.path
+        assert first.path != other.path
+        assert "secret" not in first.path.name
+        assert first.path.name.startswith("vecta-repo-")
+        assert len(first.path.stem.removeprefix("vecta-repo-")) == 64

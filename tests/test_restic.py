@@ -62,6 +62,28 @@ class TestRepoOptions:
             "/src",
         ]
 
+    def test_excludes_are_individual_argv_values(self):
+        runner = restic.ResticRunner("/src", "/repo", exclude_patterns=["*.log", "dir with space/quote'*"])
+        assert runner._build_cmd() == [
+            "restic", "backup", "--json", "--exclude=*.log",
+            "--exclude=dir with space/quote'*", "--repo", "/repo", "/src",
+        ]
+
+    def test_empty_excludes_preserve_legacy_argv(self):
+        assert restic.ResticRunner("/src", "/repo")._build_cmd() == [
+            "restic", "backup", "--json", "--repo", "/repo", "/src",
+        ]
+
+    def test_exclude_patterns_are_validated_and_deduplicated(self):
+        assert restic.validate_exclude_patterns([" *.log ", "*.log", "cache/*"]) == ["*.log", "cache/*"]
+        for invalid in (["-x"], ["!include"], ["bad\npattern"], [""], ["x" * 257], [1]):
+            try:
+                restic.validate_exclude_patterns(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Expected invalid excludes to fail: {invalid!r}")
+
     def test_stdin_runner_removes_ambient_pg_environment(self, monkeypatch):
         captured = {}
 
@@ -72,6 +94,7 @@ class TestRepoOptions:
             def __init__(self, command, **kwargs):
                 captured["command"] = command
                 captured["env"] = kwargs["env"]
+                captured["shell"] = kwargs["shell"]
 
         monkeypatch.setattr(restic, "os", SimpleNamespace(name="nt", environ={"PGPASSWORD": "ambient"}))
         monkeypatch.setattr(restic.subprocess, "Popen", FakeProc)
@@ -84,6 +107,7 @@ class TestRepoOptions:
         runner._stderr_thread.join(timeout=1)
         assert captured["env"]["PGPASSFILE"] == "/secure/pgpass"
         assert "PGPASSWORD" not in captured["env"]
+        assert captured["shell"] is False
 
     def test_terminate_signals_process_group_and_reaps_direct_child(self, monkeypatch):
         calls = []
@@ -153,6 +177,7 @@ class TestRunRestic:
             def __init__(self, *args, **kwargs):
                 captured["args"] = args[0]
                 captured["env"] = kwargs["env"]
+                captured["shell"] = kwargs["shell"]
 
             def communicate(self, timeout=None):
                 captured["timeout"] = timeout
@@ -162,9 +187,60 @@ class TestRunRestic:
         result = restic.run_restic(["init", "--repo", "r"], env={"K": "V"})
         assert captured["args"] == ["restic", "init", "--repo", "r"]
         assert captured["env"]["K"] == "V"
+        assert captured["shell"] is False
         assert result.exit_code == 0
         assert result.stderr_tail == "err"
         assert result.timed_out is False
+
+    def test_retention_args_and_lock_recovery_retry(self, monkeypatch):
+        assert restic.forget_args("sftp:user@host:/repo", {"keep_within_days": 14, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0}, 2222) == [
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp", "forget", "--prune",
+            "--keep-within", "14d", "--repo", "sftp:user@host:/repo",
+        ]
+        assert restic.forget_args("r", {"keep_within_days": None, "keep_daily": 2, "keep_weekly": 0, "keep_monthly": 3}) == [
+            "forget", "--prune", "--keep-daily", "2", "--keep-monthly", "3", "--repo", "r",
+        ]
+        calls = []
+        outcomes = [FakeResult(1, "repository is locked"), FakeResult(0), FakeResult(0)]
+
+        def fake_run(args, env=None, **kwargs):
+            calls.append((args, env, kwargs))
+            return outcomes.pop(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run)
+        result = restic.run_forget("repo", {"keep_within_days": 7, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0}, env={"RESTIC_PASSWORD": "secret"})
+        assert result.exit_code == 0
+        assert [call[0][0] for call in calls] == ["forget", "unlock", "forget"]
+        assert calls[0][0] == calls[2][0]
+        assert all(call[1] == {"RESTIC_PASSWORD": "secret"} for call in calls)
+        assert all("--remove-all" not in call[0] for call in calls)
+        assert "unlock exited 0" in result.recovery_message
+
+    def test_lock_detector_is_specific(self):
+        for message in (
+            "Fatal: repository is already locked by another process",
+            "unable to create lock in backend",
+            "Lock file /repo/locks/abc exists",
+        ):
+            assert restic.is_repository_lock_error(message)
+        for message in ("permission denied", "wrong password", "network lock service unavailable", "lock cleanup complete"):
+            assert not restic.is_repository_lock_error(message)
+
+    def test_retention_validation_is_strict(self):
+        for policy in (
+            {"keep_within_days": True},
+            {"keep_within_days": 7.0},
+            {"keep_within_days": "7"},
+            {"keep_within_days": 7, "keep_daily": 1},
+            {"keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0},
+            {"keep_daily": 1, "extra": 2},
+        ):
+            try:
+                restic.forget_args("repo", policy)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Expected invalid retention policy to fail: {policy!r}")
 
     def test_default_timeout_is_120(self, monkeypatch):
         captured = {}

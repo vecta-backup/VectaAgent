@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,11 +23,14 @@ logger = logging.getLogger("vecta_agent")
 # command would otherwise block the agent pass indefinitely. Not
 # user-configurable, like the 12h backup cap in agent.py.
 PROBE_TIMEOUT_SECONDS = 120
+PRUNE_TIMEOUT_SECONDS = 60 * 60
 
 # When `run_restic` runs with a cancel event, `communicate` is called in
 # slices of this length so the event is checked (and the process killed)
 # within about a second of cancellation being requested.
 CANCEL_POLL_SLICE_SECONDS = 1.0
+MAX_STDERR_CHARS = 4000
+MAX_STDERR_LINES = 100
 
 
 @dataclass
@@ -44,6 +49,7 @@ class ResticResult:
     # set (user cancellation reaching the probe/init phase); exit_code is
     # then always 130.
     cancelled: bool = False
+    recovery_message: str | None = None
 
 
 class ResticRunner:
@@ -58,6 +64,7 @@ class ResticRunner:
         stdin_filename: str | None = None,
         source_command: list[str] | None = None,
         unset_env: tuple[str, ...] = (),
+        exclude_patterns: list[str] | None = None,
     ) -> None:
         self.source = source
         self.destination = destination
@@ -66,6 +73,7 @@ class ResticRunner:
         self.stdin_filename = stdin_filename
         self.source_command = list(source_command) if source_command is not None else None
         self.unset_env = tuple(unset_env)
+        self.exclude_patterns = validate_exclude_patterns(exclude_patterns or [])
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._stderr_thread: threading.Thread | None = None
@@ -76,6 +84,7 @@ class ResticRunner:
             "restic",
             "backup",
             "--json",
+            *(f"--exclude={pattern}" for pattern in self.exclude_patterns),
             *repo_options(self.destination, self.port),
             "--repo",
             self.destination,
@@ -100,6 +109,7 @@ class ResticRunner:
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            shell=False,
             start_new_session=(os.name == "posix"),
         )
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
@@ -111,6 +121,8 @@ class ResticRunner:
         for line in self._proc.stderr:
             with self._lock:
                 self._stderr_lines.append(line.rstrip("\n"))
+                if len(self._stderr_lines) > MAX_STDERR_LINES:
+                    del self._stderr_lines[:-MAX_STDERR_LINES]
 
     def stream(self):
         """Yield parsed JSON objects from restic stdout."""
@@ -201,6 +213,124 @@ def repo_options(destination: str, port: int | None) -> list[str]:
     return ["-o", f"sftp.command=ssh -p {port} {connection} -s sftp"]
 
 
+MAX_EXCLUDE_PATTERNS = 100
+MAX_EXCLUDE_PATTERN_CHARS = 256
+MAX_EXCLUDE_SERIALIZED_BYTES = 16 * 1024
+MAX_RETENTION_VALUE = 3650
+
+
+def validate_exclude_patterns(value: Any) -> list[str]:
+    """Validate untrusted filesystem excludes and preserve first-seen order."""
+    if not isinstance(value, list) or len(value) > MAX_EXCLUDE_PATTERNS:
+        raise ValueError("exclude_patterns must be a list of at most 100 patterns.")
+    patterns: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, str):
+            raise ValueError("exclude_patterns must contain only strings.")
+        pattern = raw.strip()
+        if not pattern or len(pattern) > MAX_EXCLUDE_PATTERN_CHARS:
+            raise ValueError("Each exclude pattern must be non-empty and at most 256 characters.")
+        if pattern.startswith(("-", "!")) or any(unicodedata.category(char) == "Cc" for char in pattern):
+            raise ValueError("Exclude patterns cannot begin with '-' or '!' or contain control characters.")
+        if pattern not in seen:
+            patterns.append(pattern)
+            seen.add(pattern)
+    if len(json.dumps(patterns, ensure_ascii=False).encode("utf-8")) > MAX_EXCLUDE_SERIALIZED_BYTES:
+        raise ValueError("Serialized exclude patterns exceed 16 KiB.")
+    return patterns
+
+
+def validate_retention_policy(value: Any) -> dict[str, int | None] | None:
+    """Validate the supported strict retention policy wire format."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("retention_policy must be an object or null.")
+    allowed = {"keep_within_days", "keep_daily", "keep_weekly", "keep_monthly"}
+    if set(value) - allowed:
+        raise ValueError("retention_policy contains unsupported fields.")
+    normalized: dict[str, int | None] = {}
+    for key in allowed:
+        item = value.get(key, 0 if key != "keep_within_days" else None)
+        if item is None and key == "keep_within_days":
+            normalized[key] = None
+            continue
+        if type(item) is not int or item < (1 if key == "keep_within_days" else 0) or item > MAX_RETENTION_VALUE:
+            raise ValueError("Retention values must be strict integers in the allowed range.")
+        normalized[key] = item
+    if normalized["keep_within_days"] is not None:
+        if any(normalized[f"keep_{period}"] for period in ("daily", "weekly", "monthly")):
+            raise ValueError("Age-window and calendar retention rules cannot be combined.")
+    elif not any(normalized[f"keep_{period}"] for period in ("daily", "weekly", "monthly")):
+        raise ValueError("At least one retention rule must be positive.")
+    return normalized
+
+
+def forget_args(destination: str, policy: dict[str, int | None], port: int | None = None) -> list[str]:
+    """Build argv from the validated, structured policy only."""
+    policy = validate_retention_policy(policy)
+    if policy is None:
+        raise ValueError("A retention policy is required to prune.")
+    args = [*repo_options(destination, port), "forget", "--prune"]
+    within = policy.get("keep_within_days")
+    if within is not None:
+        args += ["--keep-within", f"{within}d"]
+    else:
+        for period in ("daily", "weekly", "monthly"):
+            count = policy.get(f"keep_{period}", 0) or 0
+            if count > 0:
+                args += [f"--keep-{period}", str(count)]
+    args += ["--repo", destination]
+    return args
+
+
+_LOCK_FAILURE_PHRASES = ("already locked", "unable to create lock", "repository is locked")
+
+
+def is_repository_lock_error(stderr: str) -> bool:
+    """Recognize only known Restic lock acquisition failures."""
+    low = stderr.lower()
+    if any(phrase in low for phrase in _LOCK_FAILURE_PHRASES):
+        return True
+    return bool(re.search(r"lock file[^\n]*\bexists\b", low))
+
+
+def unlock_repo(
+    destination: str,
+    port: int | None = None,
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+) -> ResticResult:
+    """Ask Restic to remove stale locks using its default safe checks."""
+    args = [*repo_options(destination, port), "unlock", "--repo", destination]
+    return run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
+
+
+def run_forget(
+    destination: str,
+    policy: dict[str, int | None],
+    port: int | None = None,
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = PRUNE_TIMEOUT_SECONDS,
+    cancel_event: threading.Event | None = None,
+) -> ResticResult:
+    """Run forget --prune, retrying once only after safe lock recovery."""
+    args = forget_args(destination, policy, port)
+    result = run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
+    if result.exit_code == 0 or result.timed_out or result.cancelled or not is_repository_lock_error(result.stderr_tail):
+        return result
+    unlock = unlock_repo(destination, port, env, cancel_event=cancel_event)
+    recovery = f"Lock recovery: unlock exited {unlock.exit_code}."
+    if unlock.exit_code != 0 or unlock.timed_out or unlock.cancelled:
+        result.recovery_message = recovery + (f" {unlock.stderr_tail[:300]}" if unlock.stderr_tail else "")
+        return result
+    retry = run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
+    retry.recovery_message = recovery + f" Retry exited {retry.exit_code}."
+    return retry
+
+
 def run_restic(
     args: list[str],
     env: dict[str, str] | None = None,
@@ -226,6 +356,7 @@ def run_restic(
         stderr=subprocess.PIPE,
         text=True,
         env=full_env,
+        shell=False,
         start_new_session=(os.name == "posix"),
     )
     if cancel_event is None:
@@ -235,7 +366,7 @@ def run_restic(
             _kill_process_group(proc)
             proc.communicate()  # reap the killed process
             return _timeout_result(args, timeout_seconds)
-        return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
+        return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip()[-MAX_STDERR_CHARS:])
 
     deadline = time.monotonic() + timeout_seconds
     while True:
@@ -248,7 +379,7 @@ def run_restic(
             stdout, stderr = proc.communicate(
                 timeout=min(CANCEL_POLL_SLICE_SECONDS, remaining)
             )
-            return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip())
+            return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip()[-MAX_STDERR_CHARS:])
         except subprocess.TimeoutExpired:
             if cancel_event.is_set():
                 _kill_process_group(proc)
