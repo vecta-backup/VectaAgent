@@ -5,51 +5,32 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import signal
 import subprocess
 import threading
 import time
-import unicodedata
-from dataclasses import dataclass
 from typing import Any
+
+from vecta_agent import restic_command, restic_progress, restic_repository
+from vecta_agent.restic_progress import compute_progress, parse_summary
+from vecta_agent.restic_types import RepoCheck, ResticResult
+
+from vecta_agent.restic_options import (
+    MAX_EXCLUDE_PATTERNS, MAX_EXCLUDE_PATTERN_CHARS, MAX_EXCLUDE_SERIALIZED_BYTES,
+    MAX_RETENTION_VALUE, forget_args, is_repository_lock_error, repo_options,
+    validate_exclude_patterns, validate_retention_policy,
+)
 
 logger = logging.getLogger("vecta_agent")
 
-# Hard cap on one-shot restic commands: the repository-existence probe
-# (`cat config`) and `init`. Both read or create a single small file, so they
-# finish in seconds on a reachable destination; anything longer means the
-# connection is hung (e.g. a firewall silently dropping packets) and the
-# command would otherwise block the agent pass indefinitely. Not
-# user-configurable, like the 12h backup cap in agent.py.
+# Bounded probe/init timeout: remote storage that hangs must not stall a pass.
 PROBE_TIMEOUT_SECONDS = 120
 PRUNE_TIMEOUT_SECONDS = 60 * 60
 
-# When `run_restic` runs with a cancel event, `communicate` is called in
-# slices of this length so the event is checked (and the process killed)
-# within about a second of cancellation being requested.
-CANCEL_POLL_SLICE_SECONDS = 1.0
-MAX_STDERR_CHARS = 4000
+# Public compatibility aliases for subprocess limits.
+CANCEL_POLL_SLICE_SECONDS = restic_command.CANCEL_POLL_SLICE_SECONDS
+MAX_STDERR_CHARS = restic_command.MAX_STDERR_CHARS
 MAX_STDERR_LINES = 100
-
-
-@dataclass
-class ResticResult:
-    exit_code: int
-    snapshot_id: str | None = None
-    files_processed: int | None = None
-    bytes_processed: int | None = None
-    transferred_bytes: int | None = None
-    stderr_tail: str = ""
-    # True when the command was killed after `timeout_seconds` rather than
-    # finishing on its own; exit_code is then always 124 (the agent's
-    # timeout convention, matching the backup watchdog).
-    timed_out: bool = False
-    # True when the command was killed because the caller's cancel event was
-    # set (user cancellation reaching the probe/init phase); exit_code is
-    # then always 130.
-    cancelled: bool = False
-    recovery_message: str | None = None
 
 
 class ResticRunner:
@@ -65,6 +46,8 @@ class ResticRunner:
         source_command: list[str] | None = None,
         unset_env: tuple[str, ...] = (),
         exclude_patterns: list[str] | None = None,
+        *,
+        job_id: str,
     ) -> None:
         self.source = source
         self.destination = destination
@@ -74,6 +57,9 @@ class ResticRunner:
         self.source_command = list(source_command) if source_command is not None else None
         self.unset_env = tuple(unset_env)
         self.exclude_patterns = validate_exclude_patterns(exclude_patterns or [])
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("A job ID is required to tag Restic backups.")
+        self.job_id = job_id
         self._proc: subprocess.Popen[str] | None = None
         self._stderr_lines: list[str] = []
         self._stderr_thread: threading.Thread | None = None
@@ -84,6 +70,7 @@ class ResticRunner:
             "restic",
             "backup",
             "--json",
+            f"--tag=job:{self.job_id}",
             *(f"--exclude={pattern}" for pattern in self.exclude_patterns),
             *repo_options(self.destination, self.port),
             "--repo",
@@ -185,117 +172,6 @@ class ResticRunner:
         return self._proc.returncode
 
 
-def repo_options(destination: str, port: int | None) -> list[str]:
-    """Extended restic options for a destination.
-
-    SFTP with a non-default port: restic's `sftp.command` option replaces the
-    default ssh invocation ENTIRELY and restic does not append the sftp
-    subsystem for it, so the command must carry `-s sftp` itself (restic
-    sftp.go buildSSHCommand; no %h/%r placeholders exist). Only the legacy
-    `sftp:user@host:/path` format is overridden — with the
-    `sftp://user@host:port/path` URL format restic reads the port from the URL
-    and needs no override. Ignored for non-sftp destinations — their locations
-    carry ports in their URL syntax.
-    """
-    if port is None or not destination.startswith("sftp:"):
-        return []
-    if destination.startswith("sftp://"):
-        return []
-    connection = destination[len("sftp:"):].split(":", 1)[0]
-    if not connection:
-        logger.warning(
-            "Could not parse the SFTP destination %r; ignoring SSH port %s. "
-            "Use the sftp:user@host:/path format.",
-            destination,
-            port,
-        )
-        return []
-    return ["-o", f"sftp.command=ssh -p {port} {connection} -s sftp"]
-
-
-MAX_EXCLUDE_PATTERNS = 100
-MAX_EXCLUDE_PATTERN_CHARS = 256
-MAX_EXCLUDE_SERIALIZED_BYTES = 16 * 1024
-MAX_RETENTION_VALUE = 3650
-
-
-def validate_exclude_patterns(value: Any) -> list[str]:
-    """Validate untrusted filesystem excludes and preserve first-seen order."""
-    if not isinstance(value, list) or len(value) > MAX_EXCLUDE_PATTERNS:
-        raise ValueError("exclude_patterns must be a list of at most 100 patterns.")
-    patterns: list[str] = []
-    seen: set[str] = set()
-    for raw in value:
-        if not isinstance(raw, str):
-            raise ValueError("exclude_patterns must contain only strings.")
-        pattern = raw.strip()
-        if not pattern or len(pattern) > MAX_EXCLUDE_PATTERN_CHARS:
-            raise ValueError("Each exclude pattern must be non-empty and at most 256 characters.")
-        if pattern.startswith(("-", "!")) or any(unicodedata.category(char) == "Cc" for char in pattern):
-            raise ValueError("Exclude patterns cannot begin with '-' or '!' or contain control characters.")
-        if pattern not in seen:
-            patterns.append(pattern)
-            seen.add(pattern)
-    if len(json.dumps(patterns, ensure_ascii=False).encode("utf-8")) > MAX_EXCLUDE_SERIALIZED_BYTES:
-        raise ValueError("Serialized exclude patterns exceed 16 KiB.")
-    return patterns
-
-
-def validate_retention_policy(value: Any) -> dict[str, int | None] | None:
-    """Validate the supported strict retention policy wire format."""
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("retention_policy must be an object or null.")
-    allowed = {"keep_within_days", "keep_daily", "keep_weekly", "keep_monthly"}
-    if set(value) - allowed:
-        raise ValueError("retention_policy contains unsupported fields.")
-    normalized: dict[str, int | None] = {}
-    for key in allowed:
-        item = value.get(key, 0 if key != "keep_within_days" else None)
-        if item is None and key == "keep_within_days":
-            normalized[key] = None
-            continue
-        if type(item) is not int or item < (1 if key == "keep_within_days" else 0) or item > MAX_RETENTION_VALUE:
-            raise ValueError("Retention values must be strict integers in the allowed range.")
-        normalized[key] = item
-    if normalized["keep_within_days"] is not None:
-        if any(normalized[f"keep_{period}"] for period in ("daily", "weekly", "monthly")):
-            raise ValueError("Age-window and calendar retention rules cannot be combined.")
-    elif not any(normalized[f"keep_{period}"] for period in ("daily", "weekly", "monthly")):
-        raise ValueError("At least one retention rule must be positive.")
-    return normalized
-
-
-def forget_args(destination: str, policy: dict[str, int | None], port: int | None = None) -> list[str]:
-    """Build argv from the validated, structured policy only."""
-    policy = validate_retention_policy(policy)
-    if policy is None:
-        raise ValueError("A retention policy is required to prune.")
-    args = [*repo_options(destination, port), "forget", "--prune"]
-    within = policy.get("keep_within_days")
-    if within is not None:
-        args += ["--keep-within", f"{within}d"]
-    else:
-        for period in ("daily", "weekly", "monthly"):
-            count = policy.get(f"keep_{period}", 0) or 0
-            if count > 0:
-                args += [f"--keep-{period}", str(count)]
-    args += ["--repo", destination]
-    return args
-
-
-_LOCK_FAILURE_PHRASES = ("already locked", "unable to create lock", "repository is locked")
-
-
-def is_repository_lock_error(stderr: str) -> bool:
-    """Recognize only known Restic lock acquisition failures."""
-    low = stderr.lower()
-    if any(phrase in low for phrase in _LOCK_FAILURE_PHRASES):
-        return True
-    return bool(re.search(r"lock file[^\n]*\bexists\b", low))
-
-
 def unlock_repo(
     destination: str,
     port: int | None = None,
@@ -303,9 +179,9 @@ def unlock_repo(
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> ResticResult:
-    """Ask Restic to remove stale locks using its default safe checks."""
-    args = [*repo_options(destination, port), "unlock", "--repo", destination]
-    return run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
+    return restic_repository.unlock_repo(
+        destination, port, env, timeout_seconds, cancel_event, run_command=run_restic
+    )
 
 
 def run_forget(
@@ -315,20 +191,23 @@ def run_forget(
     env: dict[str, str] | None = None,
     timeout_seconds: int = PRUNE_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
+    *,
+    job_id: str,
 ) -> ResticResult:
-    """Run forget --prune, retrying once only after safe lock recovery."""
-    args = forget_args(destination, policy, port)
-    result = run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
-    if result.exit_code == 0 or result.timed_out or result.cancelled or not is_repository_lock_error(result.stderr_tail):
-        return result
-    unlock = unlock_repo(destination, port, env, cancel_event=cancel_event)
-    recovery = f"Lock recovery: unlock exited {unlock.exit_code}."
-    if unlock.exit_code != 0 or unlock.timed_out or unlock.cancelled:
-        result.recovery_message = recovery + (f" {unlock.stderr_tail[:300]}" if unlock.stderr_tail else "")
-        return result
-    retry = run_restic(args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event)
-    retry.recovery_message = recovery + f" Retry exited {retry.exit_code}."
-    return retry
+    return restic_repository.run_forget(
+        destination, policy, port, env, timeout_seconds, cancel_event, job_id=job_id,
+        run_command=run_restic, unlock_command=unlock_repo,
+    )
+
+
+def _timeout_result(args: list[str], timeout_seconds: int) -> ResticResult:
+    return restic_command.timeout_result(args, timeout_seconds)
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    restic_command.kill_process_group(
+        proc, os_module=os, subprocess_module=subprocess
+    )
 
 
 def run_restic(
@@ -337,119 +216,18 @@ def run_restic(
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> ResticResult:
-    """Run a one-shot restic command and capture exit code + stderr tail.
-
-    Bounded by `timeout_seconds`: on expiry the process is killed (no grace
-    period — a one-shot command past its deadline is already hung) and the
-    result carries `timed_out=True` with exit code 124.
-
-    With `cancel_event`, the wait happens in short slices and the process is
-    killed as soon as the event is set — the result carries `cancelled=True`
-    with exit code 130. This lets the agent's cancel poller stop a hung
-    probe/init (wrong credentials, unreachable destination) instead of
-    waiting out the full probe timeout.
-    """
-    full_env = {**os.environ, **(env or {})}
-    proc = subprocess.Popen(
-        ["restic", *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=full_env,
-        shell=False,
-        start_new_session=(os.name == "posix"),
-    )
-    if cancel_event is None:
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            proc.communicate()  # reap the killed process
-            return _timeout_result(args, timeout_seconds)
-        return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip()[-MAX_STDERR_CHARS:])
-
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_process_group(proc)
-            proc.communicate()  # reap the killed process
-            return _timeout_result(args, timeout_seconds)
-        try:
-            stdout, stderr = proc.communicate(
-                timeout=min(CANCEL_POLL_SLICE_SECONDS, remaining)
-            )
-            return ResticResult(exit_code=proc.returncode, stderr_tail=stderr.strip()[-MAX_STDERR_CHARS:])
-        except subprocess.TimeoutExpired:
-            if cancel_event.is_set():
-                _kill_process_group(proc)
-                proc.communicate()  # reap the killed process
-                return ResticResult(
-                    exit_code=130,
-                    stderr_tail=f"restic {args[0]} was cancelled by user",
-                    cancelled=True,
-                )
-
-
-def _timeout_result(args: list[str], timeout_seconds: int) -> ResticResult:
-    return ResticResult(
-        exit_code=124,
-        stderr_tail=f"restic {args[0]} timed out after {timeout_seconds}s and was killed",
-        timed_out=True,
+    return restic_command.run_restic(
+        args,
+        env,
+        timeout_seconds,
+        cancel_event,
+        os_module=os,
+        subprocess_module=subprocess,
+        kill_process_group=_kill_process_group,
     )
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
-    try:
-        if os.name == "posix":
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except ProcessLookupError:
-        pass
-
-
-class RepoCheck:
-    """Result of a repository existence probe.
-
-    `exists` is True when the repo is present, False when restic reports it
-    definitively missing, and None when the check is inconclusive (e.g. the
-    storage backend is unreachable or the password is wrong).
-
-    `timed_out` is True when the probe was killed by the timeout instead of
-    finishing with a restic verdict — `exists` is then None, but the caller
-    should report a network-timeout failure rather than suggesting setup.
-
-    `cancelled` is True when the probe was killed because the cancel event
-    was set (user cancellation); `exists` is then None too.
-    """
-
-    def __init__(
-        self,
-        exists: bool | None,
-        stderr_tail: str = "",
-        timed_out: bool = False,
-        cancelled: bool = False,
-    ) -> None:
-        self.exists = exists
-        self.stderr_tail = stderr_tail
-        self.timed_out = timed_out
-        self.cancelled = cancelled
-
-
-def _looks_missing(stderr: str) -> bool:
-    """Whether a non-zero `restic cat config` stderr means the repo is absent.
-
-    `unable to open config file` also prefixes permission errors on an existing
-    repo, so it only counts as missing when the stderr names a missing-path
-    cause rather than a permission or credentials problem.
-    """
-    low = stderr.lower()
-    if "repository does not exist" in low:
-        return True
-    if "unable to open config file" in low:
-        return any(m in low for m in ("no such file", "not found", "does not exist"))
-    return False
+_looks_missing = restic_repository._looks_missing
 
 
 def check_repo(
@@ -459,31 +237,9 @@ def check_repo(
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> RepoCheck:
-    """Probe whether a restic repository exists at `destination`.
-
-    Uses `restic cat config`, whose exit code since restic 0.17 is 0 when the
-    repo exists and 10 when it definitively does not. Any other exit code means
-    the check is inconclusive and the caller must NOT initialize.
-
-    Bounded by `timeout_seconds`: a probe that outlives it (a hung connection,
-    not a restic verdict) returns `exists=None, timed_out=True`. A probe killed
-    via `cancel_event` returns `exists=None, cancelled=True`.
-    """
-    args = [*repo_options(destination, port), "cat", "config", "--repo", destination]
-    result = run_restic(
-        args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    return restic_repository.check_repo(
+        destination, env, port, timeout_seconds, cancel_event, run_command=run_restic
     )
-    if result.cancelled:
-        return RepoCheck(None, result.stderr_tail, cancelled=True)
-    if result.timed_out:
-        return RepoCheck(None, result.stderr_tail, timed_out=True)
-    if result.exit_code == 0:
-        return RepoCheck(True)
-    if result.exit_code == 10:
-        return RepoCheck(False, result.stderr_tail)
-    if result.exit_code == 1 and _looks_missing(result.stderr_tail):
-        return RepoCheck(False, result.stderr_tail)
-    return RepoCheck(None, result.stderr_tail)
 
 
 def init_repo(
@@ -493,36 +249,6 @@ def init_repo(
     timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
     cancel_event: threading.Event | None = None,
 ) -> ResticResult:
-    """Initialize a new restic repository at `destination`."""
-    args = [*repo_options(destination, port), "init", "--repo", destination]
-    return run_restic(
-        args, env=env, timeout_seconds=timeout_seconds, cancel_event=cancel_event
+    return restic_repository.init_repo(
+        destination, env, port, timeout_seconds, cancel_event, run_command=run_restic
     )
-
-
-def parse_summary(obj: dict[str, Any]) -> dict[str, Any]:
-    """Extract fields from a restic summary JSON object."""
-    result: dict[str, Any] = {}
-    result["snapshot_id"] = obj.get("snapshot_id")
-    result["files_processed"] = obj.get("total_files_processed")
-    result["bytes_processed"] = obj.get("total_bytes_processed")
-    # transferred_bytes: post-dedup upload size
-    transferred = obj.get("data_added_packed")
-    if transferred is None:
-        transferred = obj.get("data_added")
-    result["transferred_bytes"] = transferred
-    return result
-
-
-def compute_progress(obj: dict[str, Any]) -> int | None:
-    """Compute 0-99 progress from a restic status object."""
-    percent = obj.get("percent_done")
-    if isinstance(percent, (int, float)):
-        val = int(percent * 100)
-        return max(0, min(val, 99))
-    total = obj.get("total_bytes")
-    done = obj.get("bytes_done")
-    if isinstance(total, (int, float)) and isinstance(done, (int, float)) and total > 0:
-        val = int((done / total) * 100)
-        return max(0, min(val, 99))
-    return None

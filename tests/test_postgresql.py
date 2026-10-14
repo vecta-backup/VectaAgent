@@ -66,9 +66,11 @@ def test_restic_builds_stdin_from_command_without_shell():
         "s3:bucket/repository",
         stdin_filename=postgresql.stdin_filename(SOURCE),
         source_command=postgresql.build_pg_dump_argv(SOURCE),
+        job_id="database-job",
     )
     command = runner._build_cmd()
     assert command[:2] == ["restic", "backup"]
+    assert "--tag=job:database-job" in command
     assert command[command.index("--stdin-from-command")] == "--stdin-from-command"
     assert command[command.index("--stdin-filename") + 1] == "postgresql-orders-prod.dump"
     assert command[command.index("--") + 1:] == postgresql.build_pg_dump_argv(SOURCE)

@@ -241,6 +241,8 @@ The agent is **not a daemon**. Cron invokes it every few minutes and it does a s
 ```
 
 - `flock -n` makes overlapping runs fail fast instead of stacking up.
+- The agent also takes best-effort local locks per job and destination, so separate agent
+  processes on the same machine do not run one job twice or write to one repository at once.
 - The cron interval only bounds how late a due job starts; the **backend** decides whether a
   job is due using `schedule_interval_minutes`.
 
@@ -269,8 +271,10 @@ for each job:
       probe/init command and reports "Cancelled by user" instead of waiting
       out the 120s probe timeout
 
-    run restic backup (source -> destination), streaming progress + polling cancel
+    run restic backup (source -> destination), tagged with job:<JOB_ID>, streaming progress + polling cancel
     a watchdog kills restic after 12h and reports a distinct timeout failure
+    if a recognized stale-lock error occurs, unlock and retry the backup once
+    after a successful backup, apply the optional per-job retention policy
     report "success" (with snapshot id, counts, bytes),
            "warning" (backup completed but zero files were scanned — check the source path),
            or "failed" (with stderr tail)
@@ -283,8 +287,41 @@ Key points:
   does not exist" error). If the check is inconclusive — network unreachable, wrong
   password, permission denied — the job is reported failed and **no** initialization
   happens. `restic init` never overwrites an existing repository.
-- **The agent never deletes or prunes anything.** It only reads the source and appends to
-  the repository. Restores are manual (via restic) and never performed automatically.
+- **Pruning is opt-in and scoped to a job.** Every new snapshot is tagged `job:<JOB_ID>`.
+  When a job has a retention policy, the agent runs `restic forget --prune` only after that
+  job's backup succeeds, and targets only snapshots carrying the same job tag. Without a
+  policy, it never prunes. If pruning fails after the snapshot was committed, the run reports
+  a warning and keeps the successful backup result; it does not roll the snapshot back.
+- **Lock recovery is bounded.** On recognized Restic lock-acquisition errors, the agent
+  calls `restic unlock` and retries the backup once. It does not unlock or retry on unrelated
+  errors, cancellations, or timeouts. Pruning uses the same safe unlock-and-retry behavior.
+- **Restores remain manual.** The agent does not restore data automatically.
+
+### Exclusions and retention
+
+Filesystem jobs may provide `exclude_patterns`, a list of Restic exclude patterns. The agent
+validates the list and passes each pattern as its own `--exclude` argument. Database jobs do
+not support filesystem excludes.
+
+Retention is optional and configured with `retention_policy` on a job. Supported forms are
+either an age window or calendar keep counts (do not combine the two):
+
+```json
+{"keep_within_days": 30}
+```
+
+or:
+
+```json
+{"keep_daily": 7, "keep_weekly": 4, "keep_monthly": 12}
+```
+
+Calendar fields may be omitted or set to zero, but at least one must be positive. Values are
+bounded to 3,650; `keep_within_days` must be positive. The agent applies the policy only
+after a successful snapshot and scopes Restic's forget/prune command to `job:<JOB_ID>`, so
+retention for one job does not remove snapshots created by another job in the same
+repository. Pruning reports removed snapshot IDs when Restic provides them. A prune failure
+is reported as a warning because the backup itself has already completed successfully.
 
 ---
 
