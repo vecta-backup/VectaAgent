@@ -10,6 +10,8 @@ Stateless backup agent for the [Vecta](https://vectaapp.com) platform. Runs on L
 - **Progress reporting** — live progress and cancellation support via cron-driven polling
 - **PostgreSQL backups** — streams custom-format `pg_dump` archives into Restic without staging a full dump file
 - **Local hooks** — root-controlled pre/post hook catalog with schema-validated parameters and bounded execution
+- **Retention and excludes** — optional filesystem excludes and per-job snapshot retention, scoped so one job cannot prune another job's snapshots
+- **Lock recovery** — prevents overlapping local runs and safely retries once after a recognized stale Restic lock
 - **Secure by design** — repo passwords and cloud credentials stay on the machine, never sent to the backend
 
 ## Quick Start
@@ -104,6 +106,11 @@ reduction. Database backups restore manually with `restic dump <snapshot> <stdin
 | pg_restore --dbname=<target>`. See [AGENT_USAGE.md](AGENT_USAGE.md#postgresql-database-jobs)
 for setup, restore, capability, and local hook catalog details.
 
+Filesystem jobs may also specify `exclude_patterns`. Any job may opt into `retention_policy`
+to prune only snapshots created by that job, after a successful backup. Without a retention
+policy, snapshots are never pruned. See [AGENT_USAGE.md](AGENT_USAGE.md#exclusions-and-retention)
+for the supported policy fields and behavior.
+
 ### Root privileges
 
 On Linux, operational commands (`register`, `setup`, `hooks add`, `hooks publish`, `repo init`, `run`, and `update`) must be
@@ -160,6 +167,8 @@ The agent is designed to run from cron:
 
 - The backend decides when jobs are due via `schedule_interval_minutes`
 - `flock -n` prevents overlapping runs; a slow run never overlaps a new one
+- The agent also takes best-effort local locks per job and destination, and recovers from
+  recognized stale Restic locks by unlocking and retrying the backup once
 - Every 2 minutes is a good balance between responsiveness and overhead
 
 ## Development

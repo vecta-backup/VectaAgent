@@ -29,9 +29,10 @@ htmlcov/
 # Build artifacts
 .build-venv/
 
-# Local / agent docs (not for public repo)
+# Local
 AGENTS.md
 FRONTEND_SETUP_REFERENCE.md
+LOCAL_HYPERV_SETUP.md
 
 # OS
 Thumbs.db

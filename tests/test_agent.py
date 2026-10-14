@@ -40,7 +40,7 @@ class FakeApiClient:
 
 
 class FakeRunner:
-    def __init__(self, source, destination, port=None, env=None):
+    def __init__(self, source, destination, port=None, env=None, job_id=None):
         self.source = source
         self.destination = destination
         self.port = port
@@ -144,7 +144,7 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.summary = {
                 "message_type": "summary",
@@ -176,7 +176,7 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j2", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.exit_code = 1
             r.stderr = "restic failed"
@@ -205,7 +205,7 @@ class TestRunAgent:
             {"cancel_requested": True},
         ]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.status_count = 100  # long-running
             r.exit_code = 130
@@ -309,7 +309,7 @@ class TestRunAgent:
         fake.jobs = [{"job_id": "jt", "source": "/src", "destination": "/dest"}]
         runners = []
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.status_count = 1000  # would never finish on its own
             runners.append(r)
@@ -335,7 +335,7 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "jr", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
             return r
@@ -358,7 +358,7 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "jz", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.summary = {
                 "message_type": "summary",
@@ -391,7 +391,7 @@ class TestRunAgent:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "jd", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.summary = {
                 "message_type": "summary",
@@ -467,7 +467,7 @@ class TestRunAgent:
 
         captured_env = {}
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             captured_env.update(env or {})
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
@@ -510,7 +510,7 @@ class TestRunAgent:
         fake.jobs = [{"job_id": "j6", "source": "/src", "destination": "/dest"}]
         init_calls = patch_repo(monkeypatch, exists=False)
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "snap1"}
             return r
@@ -641,7 +641,7 @@ class TestRunAgent:
             lambda *a, **kw: init_calls.append(a) or restic.ResticResult(exit_code=0),
         )
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
-        monkeypatch.setattr(agent.restic, "ResticRunner", lambda source, destination, port=None, env=None: FakeRunner(source, destination, port, env))
+        monkeypatch.setattr(agent.restic, "ResticRunner", lambda source, destination, port=None, env=None, job_id=None: FakeRunner(source, destination, port, env))
 
         agent.run_agent()
 
@@ -654,7 +654,7 @@ class TestRunAgent:
         fake.jobs = [{"job_id": "j4", "source": "/src", "destination": "/dest"}]
 
         class MissingRunner:
-            def __init__(self, source, destination, port=None, env=None):
+            def __init__(self, source, destination, port=None, env=None, job_id=None):
                 pass
 
             def start(self):
@@ -740,7 +740,7 @@ class TestDestinationCredentials:
 
         captured_env = {}
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             captured_env.update(env or {})
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
@@ -769,7 +769,7 @@ class TestDestinationCredentials:
 
         captured_env = {}
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             captured_env.update(env or {})
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
@@ -792,7 +792,7 @@ class TestDestinationCredentials:
 
         captured_env = {}
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             captured_env.update(env or {})
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
@@ -839,7 +839,7 @@ class TestDestinationCredentials:
         fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
         runner_called = []
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             runner_called.append((source, destination))
             r = FakeRunner(source, destination, port, env)
             r.summary = {"message_type": "summary", "snapshot_id": "s1"}
@@ -862,7 +862,7 @@ class TestDestinationCredentials:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j1", "source": "/src", "destination": dest}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.exit_code = 1
             r.stderr = "AccessDenied: The AWS Access Key Id you provided does not exist"
@@ -886,7 +886,7 @@ class TestDestinationCredentials:
         fake = FakeApiClient("a1", "vc_" + "k" * 64)
         fake.jobs = [{"job_id": "j1", "source": "/src", "destination": "/dest"}]
 
-        def fake_runner(source, destination, port=None, env=None):
+        def fake_runner(source, destination, port=None, env=None, job_id=None):
             r = FakeRunner(source, destination, port, env)
             r.exit_code = 1
             r.stderr = "no space left on device"
@@ -927,7 +927,7 @@ class TestDestinationCredentials:
         monkeypatch.setattr(agent.api, "ApiClient", lambda *a, **kw: fake)
         monkeypatch.setattr(
             agent.restic, "ResticRunner",
-            lambda source, destination, port=None, env=None: FakeRunner(source, destination, port, env),
+            lambda source, destination, port=None, env=None, job_id=None: FakeRunner(source, destination, port, env),
         )
         monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
         monkeypatch.setattr(agent, "CANCEL_INTERVAL_SECONDS", 0.05)
@@ -950,3 +950,13 @@ class TestJobLock:
         assert agent._safe_lock_name("a/b") == "a_b"
         assert agent._safe_lock_name("job-1") == "job-1"
         assert agent._safe_lock_name("") == ""
+
+    def test_repository_lock_uses_stable_destination_digest(self):
+        first = agent.RepositoryLock("  s3:https://user:secret@example/repo  ")
+        second = agent.RepositoryLock("s3:https://user:secret@example/repo")
+        other = agent.RepositoryLock("s3:https://other/repo")
+        assert first.path == second.path
+        assert first.path != other.path
+        assert "secret" not in first.path.name
+        assert first.path.name.startswith("vecta-repo-")
+        assert len(first.path.stem.removeprefix("vecta-repo-")) == 64

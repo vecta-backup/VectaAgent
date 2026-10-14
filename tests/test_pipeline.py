@@ -23,7 +23,7 @@ class FakeClient:
 class FakeResticRunner:
     instances = []
 
-    def __init__(self, source, destination, port=None, env=None, stdin_filename=None, source_command=None, unset_env=()):
+    def __init__(self, source, destination, port=None, env=None, stdin_filename=None, source_command=None, unset_env=(), exclude_patterns=None, job_id=None):
         self.source = source
         self.destination = destination
         self.port = port
@@ -31,6 +31,8 @@ class FakeResticRunner:
         self.stdin_filename = stdin_filename
         self.source_command = source_command
         self.unset_env = unset_env
+        self.exclude_patterns = exclude_patterns or []
+        self.job_id = job_id
         self.exit_code = 0
         self.stderr = ""
         self.events = [{
@@ -78,6 +80,7 @@ def test_database_job_uses_stdin_filename_and_reports_restore_metadata(tmp_confi
 
     runner = FakeResticRunner.instances[0]
     assert runner.source is None
+    assert runner.job_id == "db1"
     assert runner.stdin_filename == "postgresql-orders.dump"
     assert runner.source_command == postgresql.build_pg_dump_argv(DB_SOURCE)
     assert runner.env["PGPASSFILE"] == "/secure/pgpass"
@@ -86,6 +89,7 @@ def test_database_job_uses_stdin_filename_and_reports_restore_metadata(tmp_confi
     assert terminal["status"] == "success"
     assert terminal["backup_type"] == "database"
     assert terminal["stdin_filename"] == "postgresql-orders.dump"
+    assert terminal["pruned_snapshots"] == []
     assert terminal["snapshot_id"] == "snap-db"
     assert [r["stage"] for r in terminal["stage_results"]] == ["repository", "source_capture", "restic"]
     assert {result["stage"] for result in terminal["stage_results"]} <= agent.STAGE_RESULT_STAGES
@@ -93,6 +97,196 @@ def test_database_job_uses_stdin_filename_and_reports_restore_metadata(tmp_confi
     assert "repo-secret" not in repr(client.status_reports)
     assert "Starting job db1: PostgreSQL db.internal:5432/orders -> /repo" in caplog.text
     assert "Job db1 succeeded (snapshot snap-db)." in caplog.text
+
+
+def test_file_excludes_and_prune_warning_keep_snapshot_metadata(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    prune_calls = []
+    monkeypatch.setattr(
+        restic, "run_forget",
+        lambda destination, policy, **kwargs: prune_calls.append((destination, policy, kwargs))
+        or restic.ResticResult(1, stderr_tail="prune failed"),
+    )
+    client = FakeClient()
+    job = {
+        "job_id": "file-retain", "backup_type": "files", "source": "/src",
+        "destination": "/repo", "exclude_patterns": ["*.log", "cache/*"],
+        "retention_policy": {"keep_within_days": 7},
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    runner = FakeResticRunner.instances[-1]
+    assert runner.job_id == "file-retain"
+    assert runner.exclude_patterns == ["*.log", "cache/*"]
+    assert prune_calls[0][0:2] == ("/repo", {
+        "keep_within_days": 7, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0,
+    })
+    assert prune_calls[0][2]["job_id"] == "file-retain"
+    terminal = client.status_reports[-1]
+    assert terminal["status"] == "warning"
+    assert terminal["snapshot_id"] == "snap-db"
+    assert terminal["bytes_processed"] == 4096
+    assert [item["stage"] for item in terminal["stage_results"]] == ["restic", "prune"]
+    assert terminal["stage_results"][-1]["status"] == "failed"
+    assert "prune failed" in terminal["message"]
+    assert terminal["pruned_snapshots"] == []
+
+
+def test_pruned_snapshot_ids_are_reported_on_completion(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(
+        restic,
+        "run_forget",
+        lambda *args, **kwargs: restic.ResticResult(
+            0,
+            stdout='[{"remove":[{"id":"deleted-one"},{"id":"deleted-two"}]},{"remove":[{"name":"no-id"}]}]',
+        ),
+    )
+    client = FakeClient()
+    job = {
+        "job_id": "pruned-ids", "backup_type": "files", "source": "/src",
+        "destination": "/repo", "retention_policy": {"keep_within_days": 7},
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    terminal = client.status_reports[-1]
+    assert terminal["status"] == "success"
+    assert terminal["pruned_snapshots"] == ["deleted-one", "deleted-two"]
+
+
+def test_successful_prune_with_no_deleted_snapshots_reports_empty_list(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(
+        restic,
+        "run_forget",
+        lambda *args, **kwargs: restic.ResticResult(0, stdout='[{"remove":[]}]'),
+    )
+    client = FakeClient()
+    job = {
+        "job_id": "pruned-none", "backup_type": "files", "source": "/src",
+        "destination": "/repo", "retention_policy": {"keep_within_days": 7},
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    terminal = client.status_reports[-1]
+    assert terminal["status"] == "success"
+    assert terminal["pruned_snapshots"] == []
+
+
+def test_job_excludes_reach_restic_argv(tmp_config_dir, monkeypatch):
+    real_runner_class = restic.ResticRunner
+    _setup_runtime(tmp_config_dir, monkeypatch)
+
+    class RecordingRunner(real_runner_class):
+        instances = []
+
+        def start(self):
+            self.argv = self._build_cmd()
+            self.instances.append(self)
+
+        def stream(self):
+            yield {
+                "message_type": "summary",
+                "snapshot_id": "snap-excludes",
+                "total_files_processed": 1,
+                "total_bytes_processed": 12,
+            }
+
+        def wait(self):
+            return 0
+
+        def stderr_tail(self, max_lines=20):
+            return ""
+
+    monkeypatch.setattr(agent.restic, "ResticRunner", RecordingRunner)
+    client = FakeClient()
+    job = {
+        "job_id": "file-excludes",
+        "backup_type": "files",
+        "source": "/source",
+        "destination": "/repo",
+        "exclude_patterns": ["*.log", "node_modules/*"],
+    }
+
+    agent._run_single_job(
+        client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir)
+    )
+
+    argv = RecordingRunner.instances[0].argv
+    assert "--exclude=*.log" in argv
+    assert "--exclude=node_modules/*" in argv
+    assert "--tag=job:file-excludes" in argv
+    assert argv.index("--exclude=*.log") < argv.index("--repo")
+    assert argv.index("--exclude=node_modules/*") < argv.index("--repo")
+
+
+def test_failed_backup_does_not_prune_even_with_valid_retention(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(restic, "run_forget", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not prune")))
+
+    def failing_runner(*args, **kwargs):
+        runner = FakeResticRunner(*args, **kwargs)
+        runner.exit_code = 1
+        runner.stderr = "backup failed"
+        return runner
+
+    monkeypatch.setattr(agent.restic, "ResticRunner", failing_runner)
+    client = FakeClient()
+    job = {
+        "job_id": "failed-retain", "backup_type": "files", "source": "/src",
+        "destination": "/repo", "retention_policy": {"keep_within_days": 7},
+    }
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    assert client.status_reports[-1]["status"] == "failed"
+
+
+def test_invalid_storage_config_fails_before_runner(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(agent.restic, "ResticRunner", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("backup must not start")))
+    client = FakeClient()
+    job = {
+        "job_id": "invalid-excludes", "backup_type": "database", "source_config": DB_SOURCE,
+        "destination": "/repo", "exclude_patterns": ["*.log"],
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    terminal = client.status_reports[-1]
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "validation"
+
+
+def test_backup_lock_is_unlocked_and_retried_once(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    unlocks = []
+    monkeypatch.setattr(restic, "unlock_repo", lambda destination, **kwargs: unlocks.append((destination, kwargs)) or restic.ResticResult(0))
+    created = []
+
+    def runner_factory(*args, **kwargs):
+        runner = FakeResticRunner(*args, **kwargs)
+        if not created:
+            runner.exit_code = 1
+            runner.stderr = "Fatal: repository is already locked"
+            runner.events = []
+        created.append(runner)
+        return runner
+
+    monkeypatch.setattr(agent.restic, "ResticRunner", runner_factory)
+    client = FakeClient()
+    job = {"job_id": "lock-retry", "backup_type": "files", "source": "/src", "destination": "/repo"}
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    assert len(created) == 2
+    assert unlocks and unlocks[0][0] == "/repo"
+    terminal = client.status_reports[-1]
+    assert terminal["status"] == "success"
+    assert terminal["snapshot_id"] == "snap-db"
+    assert "Lock recovery" in terminal["stage_results"][0]["message"]
 
 
 def test_process_diagnostics_redact_local_restic_secrets(tmp_config_dir, monkeypatch):
@@ -244,6 +438,35 @@ def test_post_hook_failure_keeps_completed_snapshot_id(tmp_config_dir, monkeypat
     assert terminal["status"] == "failed"
     assert terminal["stage"] == "post_hook"
     assert terminal["snapshot_id"] == "snap-db"
+
+
+def test_post_hook_failure_remains_primary_and_prune_is_reported(tmp_config_dir, monkeypatch):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    post = hooks.HookDefinition(
+        "post", "post", "desc", ("post",), "/local/post", (),
+        {"type": "object", "properties": {}}, "vecta-hook", False, 10, 100,
+    )
+    monkeypatch.setattr(agent.hooks, "load_catalog", lambda: {"post": post})
+    monkeypatch.setattr(agent.hooks, "execute_hook", lambda *a, **kw: hooks.HookResult(exit_code=9, duration_seconds=1))
+    prune_calls = []
+    monkeypatch.setattr(restic, "run_forget", lambda *a, **kw: prune_calls.append(a) or restic.ResticResult(1, stderr_tail="prune failed"))
+    client = FakeClient()
+    job = {
+        "job_id": "post-prune-fail", "backup_type": "files", "source": "/src",
+        "destination": "/repo", "post_hook": {"hook_id": "post", "parameters": {}},
+        "retention_policy": {"keep_within_days": 7},
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    terminal = client.status_reports[-1]
+    assert prune_calls
+    assert terminal["status"] == "failed"
+    assert terminal["stage"] == "post_hook"
+    assert terminal["snapshot_id"] == "snap-db"
+    assert [(item["stage"], item["status"]) for item in terminal["stage_results"][-2:]] == [
+        ("post_hook", "failed"), ("prune", "failed"),
+    ]
 
 
 def test_pre_hook_timeout_skips_capture_and_reports_timeout(tmp_config_dir, monkeypatch):

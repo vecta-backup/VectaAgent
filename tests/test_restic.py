@@ -8,11 +8,12 @@ from vecta_agent import restic
 
 
 class FakeResult:
-    def __init__(self, exit_code, stderr_tail="", timed_out=False, cancelled=False):
+    def __init__(self, exit_code, stderr_tail="", timed_out=False, cancelled=False, stdout=""):
         self.exit_code = exit_code
         self.stderr_tail = stderr_tail
         self.timed_out = timed_out
         self.cancelled = cancelled
+        self.stdout = stdout
 
 
 class TestRepoOptions:
@@ -51,16 +52,53 @@ class TestRepoOptions:
         assert restic.repo_options("s3:s3.amazonaws.com/bucket", 2222) == []
 
     def test_backup_cmd_includes_sftp_command(self):
-        runner = restic.ResticRunner("/src", "sftp:user@host:/path", port=2222)
+        runner = restic.ResticRunner("/src", "sftp:user@host:/path", port=2222, job_id="job-7")
         assert runner._build_cmd() == [
             "restic",
             "backup",
             "--json",
+            "--tag=job:job-7",
             "-o", "sftp.command=ssh -p 2222 user@host -s sftp",
             "--repo",
             "sftp:user@host:/path",
             "/src",
         ]
+
+    def test_excludes_are_individual_argv_values(self):
+        runner = restic.ResticRunner(
+            "/src", "/repo", exclude_patterns=["*.log", "dir with space/quote'*"], job_id="job-7"
+        )
+        assert runner._build_cmd() == [
+            "restic", "backup", "--json", "--tag=job:job-7", "--exclude=*.log",
+            "--exclude=dir with space/quote'*", "--repo", "/repo", "/src",
+        ]
+
+    def test_empty_excludes_preserve_legacy_argv(self):
+        assert restic.ResticRunner("/src", "/repo", job_id="legacy-job")._build_cmd() == [
+            "restic", "backup", "--json", "--tag=job:legacy-job", "--repo", "/repo", "/src",
+        ]
+
+    def test_backup_and_forget_commands_are_scoped_to_job(self):
+        runner = restic.ResticRunner("/src", "/repo", job_id="job-42")
+        backup_argv = runner._build_cmd()
+        forget_argv = restic.forget_args(
+            "/repo",
+            {"keep_within_days": 7, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0},
+            job_id="job-42",
+        )
+
+        assert "--tag=job:job-42" in backup_argv
+        assert "--tag=job:job-42" in forget_argv
+
+    def test_exclude_patterns_are_validated_and_deduplicated(self):
+        assert restic.validate_exclude_patterns([" *.log ", "*.log", "cache/*"]) == ["*.log", "cache/*"]
+        for invalid in (["-x"], ["!include"], ["bad\npattern"], [""], ["x" * 257], [1]):
+            try:
+                restic.validate_exclude_patterns(invalid)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Expected invalid excludes to fail: {invalid!r}")
 
     def test_stdin_runner_removes_ambient_pg_environment(self, monkeypatch):
         captured = {}
@@ -72,6 +110,7 @@ class TestRepoOptions:
             def __init__(self, command, **kwargs):
                 captured["command"] = command
                 captured["env"] = kwargs["env"]
+                captured["shell"] = kwargs["shell"]
 
         monkeypatch.setattr(restic, "os", SimpleNamespace(name="nt", environ={"PGPASSWORD": "ambient"}))
         monkeypatch.setattr(restic.subprocess, "Popen", FakeProc)
@@ -79,11 +118,13 @@ class TestRepoOptions:
             None, "/repo", env={"PGPASSFILE": "/secure/pgpass"},
             stdin_filename="postgresql-db.dump", source_command=["pg_dump", "--no-password"],
             unset_env=("PGPASSWORD", "PGSERVICE"),
+            job_id="db-job",
         )
         runner.start()
         runner._stderr_thread.join(timeout=1)
         assert captured["env"]["PGPASSFILE"] == "/secure/pgpass"
         assert "PGPASSWORD" not in captured["env"]
+        assert captured["shell"] is False
 
     def test_terminate_signals_process_group_and_reaps_direct_child(self, monkeypatch):
         calls = []
@@ -107,7 +148,7 @@ class TestRepoOptions:
         proc = FakeProc()
         monkeypatch.setattr(restic, "os", SimpleNamespace(name="posix", killpg=lambda pid, sig: calls.append((pid, sig))))
         monkeypatch.setattr(restic, "signal", SimpleNamespace(SIGTERM=15, SIGKILL=9))
-        runner = restic.ResticRunner("/src", "/repo")
+        runner = restic.ResticRunner("/src", "/repo", job_id="job-1")
         runner._proc = proc
         runner.terminate(grace_seconds=0.01)
         assert calls == [(1234, 15), (1234, 9)]
@@ -153,6 +194,7 @@ class TestRunRestic:
             def __init__(self, *args, **kwargs):
                 captured["args"] = args[0]
                 captured["env"] = kwargs["env"]
+                captured["shell"] = kwargs["shell"]
 
             def communicate(self, timeout=None):
                 captured["timeout"] = timeout
@@ -162,9 +204,66 @@ class TestRunRestic:
         result = restic.run_restic(["init", "--repo", "r"], env={"K": "V"})
         assert captured["args"] == ["restic", "init", "--repo", "r"]
         assert captured["env"]["K"] == "V"
+        assert captured["shell"] is False
         assert result.exit_code == 0
+        assert result.stdout == "out"
         assert result.stderr_tail == "err"
         assert result.timed_out is False
+
+    def test_retention_args_and_lock_recovery_retry(self, monkeypatch):
+        assert restic.forget_args("sftp:user@host:/repo", {"keep_within_days": 14, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0}, 2222, job_id="job-7") == [
+            "-o", "sftp.command=ssh -p 2222 user@host -s sftp", "forget", "--json", "--prune", "--tag=job:job-7",
+            "--keep-within", "14d", "--repo", "sftp:user@host:/repo",
+        ]
+        assert restic.forget_args("r", {"keep_within_days": None, "keep_daily": 2, "keep_weekly": 0, "keep_monthly": 3}, job_id="job-7") == [
+            "forget", "--json", "--prune", "--tag=job:job-7", "--keep-daily", "2", "--keep-monthly", "3", "--repo", "r",
+        ]
+        calls = []
+        outcomes = [
+            FakeResult(1, "repository is locked"),
+            FakeResult(0),
+            FakeResult(0, stdout='[{"remove":[{"id":"deleted-snapshot"}]}]'),
+        ]
+
+        def fake_run(args, env=None, **kwargs):
+            calls.append((args, env, kwargs))
+            return outcomes.pop(0)
+
+        monkeypatch.setattr(restic, "run_restic", fake_run)
+        result = restic.run_forget("repo", {"keep_within_days": 7, "keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0}, env={"RESTIC_PASSWORD": "secret"}, job_id="job-7")
+        assert result.exit_code == 0
+        assert result.stdout == '[{"remove":[{"id":"deleted-snapshot"}]}]'
+        assert [call[0][0] for call in calls] == ["forget", "unlock", "forget"]
+        assert calls[0][0] == calls[2][0]
+        assert all(call[1] == {"RESTIC_PASSWORD": "secret"} for call in calls)
+        assert all("--remove-all" not in call[0] for call in calls)
+        assert "unlock exited 0" in result.recovery_message
+
+    def test_lock_detector_is_specific(self):
+        for message in (
+            "Fatal: repository is already locked by another process",
+            "unable to create lock in backend",
+            "Lock file /repo/locks/abc exists",
+        ):
+            assert restic.is_repository_lock_error(message)
+        for message in ("permission denied", "wrong password", "network lock service unavailable", "lock cleanup complete"):
+            assert not restic.is_repository_lock_error(message)
+
+    def test_retention_validation_is_strict(self):
+        for policy in (
+            {"keep_within_days": True},
+            {"keep_within_days": 7.0},
+            {"keep_within_days": "7"},
+            {"keep_within_days": 7, "keep_daily": 1},
+            {"keep_daily": 0, "keep_weekly": 0, "keep_monthly": 0},
+            {"keep_daily": 1, "extra": 2},
+        ):
+            try:
+                restic.forget_args("repo", policy, job_id="job-7")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"Expected invalid retention policy to fail: {policy!r}")
 
     def test_default_timeout_is_120(self, monkeypatch):
         captured = {}

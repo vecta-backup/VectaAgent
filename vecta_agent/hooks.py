@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import os
-import json
 import re
-import signal
 import subprocess
 import threading
-import time
+import time as time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from vecta_agent import hook_runtime
+from vecta_agent.hook_runtime import HookResult
+
+from vecta_agent.hook_schema import (
+    HookCatalogError,
+    _validate_schema,
+    capability_metadata as capability_metadata,
+    validate_parameters,
+)
 
 try:
     import tomllib
@@ -33,10 +41,6 @@ _ALLOWED_ENTRY_KEYS = {
     "id", "name", "description", "phases", "executable", "argv",
     "parameters_schema", "run_as", "requires_root", "timeout_seconds", "output_limit_bytes",
 }
-
-
-class HookCatalogError(ValueError):
-    """The local hook catalog is unsafe, malformed, or inconsistent."""
 
 
 @dataclass(frozen=True)
@@ -63,16 +67,6 @@ class HookDefinition:
             "parameters_schema": self.parameters_schema,
             "requires_root": self.requires_root,
         }
-
-
-@dataclass
-class HookResult:
-    exit_code: int
-    duration_seconds: int
-    timed_out: bool = False
-    cancelled: bool = False
-    stdout: str = ""
-    stderr: str = ""
 
 
 def _safe_root_controlled_path(path: Path, *, executable: bool = False) -> bool:
@@ -111,61 +105,6 @@ def _safe_root_controlled_directory(path: Path) -> bool:
         return True
     except OSError:
         return False
-
-
-def _validate_schema(schema: Any) -> dict[str, Any]:
-    if not isinstance(schema, dict) or schema.get("type") != "object":
-        raise HookCatalogError("parameters_schema must be an object schema.")
-    if set(schema) - {"type", "properties", "required", "additionalProperties"}:
-        raise HookCatalogError("parameters_schema contains unsupported schema keywords.")
-    if schema.get("additionalProperties", False) is not False:
-        raise HookCatalogError("Hook parameters must reject additional properties.")
-    properties = schema.get("properties", {})
-    required = schema.get("required", [])
-    if not isinstance(properties, dict) or len(properties) > 32 or not isinstance(required, list):
-        raise HookCatalogError("parameters_schema properties/required are malformed.")
-    if any(not isinstance(key, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", key) for key in properties):
-        raise HookCatalogError("Hook parameter names are invalid.")
-    if any(any(word in key.lower() for word in ("password", "secret", "token", "credential")) for key in properties):
-        raise HookCatalogError("Hook parameter schemas must not request credentials or secrets.")
-    if any(not isinstance(key, str) for key in required) or any(key not in properties for key in required) or len(set(required)) != len(required):
-        raise HookCatalogError("Hook required parameters must name unique declared properties.")
-    for key, prop in properties.items():
-        if not isinstance(prop, dict) or set(prop) - {"type", "enum", "minLength", "maxLength", "minimum", "maximum", "pattern"}:
-            raise HookCatalogError(f"Unsupported schema for hook parameter {key!r}.")
-        kind = prop.get("type")
-        if kind not in {"string", "integer", "boolean"}:
-            raise HookCatalogError(f"Unsupported type for hook parameter {key!r}.")
-        if "enum" in prop and (
-            not isinstance(prop["enum"], list)
-            or not prop["enum"]
-            or len(prop["enum"]) > 64
-            or any(not isinstance(value, (str, int, float, bool)) for value in prop["enum"])
-            or any(isinstance(value, str) and (len(value) > 128 or "/" in value or "\\" in value) for value in prop["enum"])
-        ):
-            raise HookCatalogError(f"Invalid enum for hook parameter {key!r}.")
-        for field in ("minLength", "maxLength"):
-            bound = prop.get(field)
-            if bound is not None and (kind != "string" or isinstance(bound, bool) or not isinstance(bound, int) or not 0 <= bound <= 1024):
-                raise HookCatalogError(f"Invalid string length bound for hook parameter {key!r}.")
-        for field in ("minimum", "maximum"):
-            bound = prop.get(field)
-            if bound is not None and (kind != "integer" or isinstance(bound, bool) or not isinstance(bound, int)):
-                raise HookCatalogError(f"Invalid integer bound for hook parameter {key!r}.")
-        if "minLength" in prop and "maxLength" in prop and prop["minLength"] > prop["maxLength"]:
-            raise HookCatalogError(f"Reversed string length bounds for hook parameter {key!r}.")
-        if "minimum" in prop and "maximum" in prop and prop["minimum"] > prop["maximum"]:
-            raise HookCatalogError(f"Reversed integer bounds for hook parameter {key!r}.")
-        if "pattern" in prop:
-            if kind != "string" or not isinstance(prop["pattern"], str) or len(prop["pattern"]) > 128:
-                raise HookCatalogError(f"Invalid pattern for hook parameter {key!r}.")
-            try:
-                re.compile(prop["pattern"])
-            except (TypeError, re.error) as exc:
-                raise HookCatalogError(f"Invalid pattern for hook parameter {key!r}.") from exc
-    if len(json.dumps(schema, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > 8192:
-        raise HookCatalogError("parameters_schema must be at most 8 KiB.")
-    return schema
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> dict[str, HookDefinition]:
@@ -261,85 +200,14 @@ def validate_selection(selection: Any, catalog: dict[str, HookDefinition], phase
     return definition, values
 
 
-def validate_parameters(schema: dict[str, Any], parameters: Any) -> dict[str, Any]:
-    if not isinstance(parameters, dict):
-        raise HookCatalogError("Hook parameters must be an object.")
-    properties = schema.get("properties", {})
-    required = set(schema.get("required", []))
-    if set(parameters) - set(properties) or required - set(parameters):
-        raise HookCatalogError("Hook parameters do not match the local catalog schema.")
-    result: dict[str, Any] = {}
-    for key, value in parameters.items():
-        spec = properties[key]
-        kind = spec["type"]
-        if kind == "string":
-            valid = isinstance(value, str) and "\x00" not in value and len(value) <= spec.get("maxLength", 1024) and len(value) >= spec.get("minLength", 0)
-            if valid and "pattern" in spec:
-                valid = re.fullmatch(spec["pattern"], value) is not None
-        elif kind == "integer":
-            valid = isinstance(value, int) and not isinstance(value, bool) and spec.get("minimum", value) <= value <= spec.get("maximum", value)
-        else:
-            valid = isinstance(value, bool)
-        if "enum" in spec:
-            valid = valid and value in spec["enum"]
-        if not valid:
-            raise HookCatalogError(f"Hook parameter {key!r} does not match its declared schema.")
-        result[key] = value
-    return result
-
-
-def capability_metadata(catalog: dict[str, HookDefinition]) -> list[dict[str, Any]]:
-    metadata = [catalog[key].public_metadata() for key in sorted(catalog)]
-    if len(metadata) > 100 or len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > 250 * 1024:
-        raise HookCatalogError("Hook capability metadata exceeds the backend report limits.")
-    return metadata
-
-
-def _argv(definition: HookDefinition, parameters: dict[str, Any]) -> list[str]:
-    args: list[str] = []
-    for token in definition.argv:
-        match = _PARAM_RE.fullmatch(token)
-        if match:
-            value = parameters[match.group(1)]
-            args.append(str(value).lower() if isinstance(value, bool) else str(value))
-        else:
-            args.append(token)
-    return [definition.executable, *args]
-
-
-def _bounded_reader(pipe, box: list[str], limit: int) -> None:
-    kept = bytearray()
-    while True:
-        block = pipe.read(4096)
-        if not block:
-            break
-        if len(kept) < limit:
-            kept.extend(block[:limit - len(kept)])
-    box.append(kept.decode("utf-8", errors="replace"))
-    pipe.close()
 
 
 def _signal_process(proc: subprocess.Popen, sig: int) -> None:
-    try:
-        if os.name == "posix":
-            os.killpg(proc.pid, sig)
-        elif sig == signal.SIGTERM:
-            proc.terminate()
-        else:
-            proc.kill()
-    except ProcessLookupError:
-        pass
+    hook_runtime._signal_process(proc, sig, os)
 
 
 def _execution_identity(definition: HookDefinition) -> dict[str, Any]:
-    if os.name != "posix":
-        return {}
-    if pwd is None:
-        raise HookCatalogError("POSIX account lookup is unavailable.")
-    entry = pwd.getpwnam(definition.run_as)
-    if definition.requires_root and os.geteuid() != 0:
-        raise HookCatalogError("Root-authorized hook cannot run because the agent is not root.")
-    return {"user": entry.pw_uid, "group": entry.pw_gid, "extra_groups": ()}
+    return hook_runtime.execution_identity(definition, os_module=os, pwd_module=pwd)
 
 
 def execute_hook(
@@ -350,54 +218,13 @@ def execute_hook(
     timeout_seconds: int | None = None,
 ) -> HookResult:
     """Run one hook without a shell, inherited secrets, or unbounded output."""
-    if definition.catalog_path:
-        current = load_catalog(Path(definition.catalog_path)).get(definition.id)
-        if current != definition:
-            raise HookCatalogError("Hook catalog entry changed or became unsafe before execution.")
-    parameters = validate_parameters(definition.parameters_schema, parameters)
-    timeout_seconds = min(timeout_seconds or definition.timeout_seconds, definition.timeout_seconds, HOOK_TIMEOUT_SECONDS)
-    start = time.monotonic()
-    identity = _execution_identity(definition)
-    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
-    kwargs: dict[str, Any] = {}
-    if identity:
-        kwargs.update(identity)
-    proc = subprocess.Popen(
-        _argv(definition, parameters), shell=False, cwd="/", env=env,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=(os.name == "posix"), **kwargs,
-    )
-    out: list[str] = []
-    err: list[str] = []
-    readers = [
-        threading.Thread(target=_bounded_reader, args=(proc.stdout, out, definition.output_limit_bytes), daemon=True),
-        threading.Thread(target=_bounded_reader, args=(proc.stderr, err, definition.output_limit_bytes), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-    deadline = start + timeout_seconds
-    cancelled = timed_out = False
-    while proc.poll() is None:
-        if cancel_event is not None and cancel_event.is_set():
-            cancelled = True
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(0.1)
-    if cancelled or timed_out:
-        _signal_process(proc, signal.SIGTERM)
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            _signal_process(proc, signal.SIGKILL)
-            proc.wait()
-    else:
-        proc.wait()
-    for reader in readers:
-        reader.join(timeout=3)
-    return HookResult(
-        exit_code=proc.returncode if proc.returncode is not None else 1,
-        duration_seconds=int(time.monotonic() - start), timed_out=timed_out,
-        cancelled=cancelled, stdout=out[0] if out else "", stderr=err[0] if err else "",
+    return hook_runtime.execute_hook(
+        definition,
+        parameters,
+        cancel_event=cancel_event,
+        timeout_seconds=timeout_seconds,
+        load_catalog=load_catalog,
+        os_module=os,
+        pwd_module=pwd,
+        timeout_ceiling=HOOK_TIMEOUT_SECONDS,
     )
