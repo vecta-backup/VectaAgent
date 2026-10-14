@@ -13,11 +13,9 @@ from vecta_agent.sftp import (
     _check_sftp_connectivity,
     _destination_kind,
     _print_sftp_fix_commands,
-    _sftp_connection,
     _validate_sftp_destination,
 )
 from vecta_agent.setup_prompts import (
-    _DESTINATION_PROMPTS,
     confirm_password_saved as _confirm_password_saved,
     prompt_destination_credentials as _prompt_destination_credentials,
     prompt_password_twice as _prompt_password_twice,
@@ -206,5 +204,3 @@ def run_setup(args: argparse.Namespace) -> None:
     else:
         print(f"Repository at {destination} is ready (already existed).")
     print(f"Job {job_id} is configured and will run whenever its schedule next triggers.")
-
-

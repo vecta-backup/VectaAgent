@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import signal
-import subprocess
 import threading
 import time
 from typing import Any, Callable

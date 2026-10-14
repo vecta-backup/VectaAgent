@@ -114,5 +114,3 @@ def _print_sftp_fix_commands(destination: str, port: int | None, stderr: str) ->
         file=sys.stderr,
     )
     print("Then re-run: vecta-agent setup <job-id>", file=sys.stderr)
-
-

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import getpass
 import secrets
 import sys

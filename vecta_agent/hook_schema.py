@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vecta_agent.hooks import HookDefinition
 
 
 class HookCatalogError(ValueError):
@@ -98,5 +101,3 @@ def capability_metadata(catalog: dict[str, HookDefinition]) -> list[dict[str, An
     if len(metadata) > 100 or len(json.dumps(metadata, separators=(",", ":"), ensure_ascii=True).encode("utf-8")) > 250 * 1024:
         raise HookCatalogError("Hook capability metadata exceeds the backend report limits.")
     return metadata
-
-

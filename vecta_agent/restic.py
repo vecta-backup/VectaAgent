@@ -8,17 +8,24 @@ import os
 import signal
 import subprocess
 import threading
-import time
-from typing import Any
 
-from vecta_agent import restic_command, restic_progress, restic_repository
-from vecta_agent.restic_progress import compute_progress, parse_summary
+from vecta_agent import restic_command, restic_progress as restic_progress, restic_repository
+from vecta_agent.restic_progress import (
+    compute_progress as compute_progress,
+    parse_summary as parse_summary,
+)
 from vecta_agent.restic_types import RepoCheck, ResticResult
 
 from vecta_agent.restic_options import (
-    MAX_EXCLUDE_PATTERNS, MAX_EXCLUDE_PATTERN_CHARS, MAX_EXCLUDE_SERIALIZED_BYTES,
-    MAX_RETENTION_VALUE, forget_args, is_repository_lock_error, repo_options,
-    validate_exclude_patterns, validate_retention_policy,
+    MAX_EXCLUDE_PATTERNS as MAX_EXCLUDE_PATTERNS,
+    MAX_EXCLUDE_PATTERN_CHARS as MAX_EXCLUDE_PATTERN_CHARS,
+    MAX_EXCLUDE_SERIALIZED_BYTES as MAX_EXCLUDE_SERIALIZED_BYTES,
+    MAX_RETENTION_VALUE as MAX_RETENTION_VALUE,
+    forget_args as forget_args,
+    is_repository_lock_error as is_repository_lock_error,
+    repo_options,
+    validate_exclude_patterns,
+    validate_retention_policy as validate_retention_policy,
 )
 
 logger = logging.getLogger("vecta_agent")

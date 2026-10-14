@@ -9,7 +9,7 @@ import uuid
 from functools import partial
 from typing import Any
 
-from vecta_agent import api, backup_stage, environment, execution_plan, execution_report, hook_stage, hooks, postgresql, repository_stage, restic
+from vecta_agent import api, backup_stage, environment, execution_plan, execution_report, hook_stage, hooks, postgresql, repository_stage
 from vecta_agent.locks import RunLocks
 
 logger = logging.getLogger("vecta_agent")
@@ -259,5 +259,3 @@ def run_pipeline_job(
         if cancel_thread is not None:
             cancel_thread.join(timeout=cancel_interval_seconds + 2)
         lock.release()
-
-

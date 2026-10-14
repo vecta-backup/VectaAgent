@@ -3,17 +3,42 @@
 from __future__ import annotations
 
 import argparse
-import getpass
-import json
+import getpass as getpass
 import logging
 import os
-import secrets
-import subprocess
+import subprocess as subprocess
 import sys
-import tempfile
-from pathlib import Path
 
-from vecta_agent import __version__, agent, api, config, credentials, hooks, postgresql, restic, update
+from vecta_agent import __version__, agent, api, config, credentials, hooks, restic as restic, update
+from vecta_agent.hook_cli import (
+    _hook_entry_toml as _hook_entry_toml,
+    _prompt_value as _prompt_value,
+    _prompt_yes_no as _prompt_yes_no,
+    _toml_value as _toml_value,
+    run_hooks_add,
+    run_hooks_list,
+    run_hooks_publish,
+    run_hooks_validate,
+)
+from vecta_agent.repository_cli import (
+    _already_initialized as _already_initialized,
+    _resolve_password as _resolve_password,
+    run_repo_init,
+)
+from vecta_agent.sftp import (
+    _check_sftp_connectivity as _check_sftp_connectivity,
+    _destination_kind as _destination_kind,
+    _print_sftp_fix_commands as _print_sftp_fix_commands,
+    _sftp_connection as _sftp_connection,
+    _validate_sftp_destination as _validate_sftp_destination,
+)
+from vecta_agent.setup_prompts import _DESTINATION_PROMPTS as _DESTINATION_PROMPTS
+from vecta_agent.setup import (
+    _confirm_password_saved as _confirm_password_saved,
+    _prompt_destination_credentials as _prompt_destination_credentials,
+    _prompt_password_twice as _prompt_password_twice,
+    run_setup,
+)
 
 logger = logging.getLogger("vecta_agent")
 _IS_POSIX = os.name == "posix"
@@ -50,27 +75,6 @@ def run_run(_args: argparse.Namespace) -> None:
     agent.run_agent()
 
 
-from vecta_agent.repository_cli import (
-    _already_initialized,
-    _resolve_password,
-    run_repo_init,
-)
-from vecta_agent.sftp import (
-    _check_sftp_connectivity,
-    _destination_kind,
-    _print_sftp_fix_commands,
-    _sftp_connection,
-    _validate_sftp_destination,
-)
-from vecta_agent.setup import (
-    _DESTINATION_PROMPTS,
-    _confirm_password_saved,
-    _prompt_destination_credentials,
-    _prompt_password_twice,
-    run_setup,
-)
-
-
 # ---------------------------------------------------------------------------
 
 
@@ -80,18 +84,6 @@ def run_version(_args: argparse.Namespace) -> None:
 
 def run_update(args: argparse.Namespace) -> None:
     update.run_update(requested_version=args.version, check_only=args.check)
-
-
-from vecta_agent.hook_cli import (
-    _hook_entry_toml,
-    _prompt_value,
-    _prompt_yes_no,
-    _toml_value,
-    run_hooks_add,
-    run_hooks_list,
-    run_hooks_publish,
-    run_hooks_validate,
-)
 
 
 def _require_root(args: argparse.Namespace) -> None:

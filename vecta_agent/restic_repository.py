@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import threading
 from typing import Callable
 

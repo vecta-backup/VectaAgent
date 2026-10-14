@@ -128,5 +128,3 @@ def is_repository_lock_error(stderr: str) -> bool:
     if any(phrase in low for phrase in _LOCK_FAILURE_PHRASES):
         return True
     return bool(re.search(r"lock file[^\n]*\bexists\b", low))
-
-

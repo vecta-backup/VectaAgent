@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import tempfile
@@ -168,5 +169,3 @@ def run_hooks_publish(_args: argparse.Namespace) -> None:
         print(f"Published {len(report['hooks'])} hook(s) and agent capabilities to Vecta.")
     else:
         print("Published agent capabilities; hooks are unavailable because the local catalog is invalid.")
-
-

@@ -12,12 +12,12 @@ from typing import Any
 
 from vecta_agent import config
 from vecta_agent.postgresql_probe import (
-    MIN_PGDUMP_VERSION,
-    MIN_RESTIC_VERSION,
-    _version_tuple,
-    pg_dump_version,
-    postgresql_support_issue,
-    probe_postgresql_support,
+    MIN_PGDUMP_VERSION as MIN_PGDUMP_VERSION,
+    MIN_RESTIC_VERSION as MIN_RESTIC_VERSION,
+    _version_tuple as _version_tuple,
+    pg_dump_version as pg_dump_version,
+    postgresql_support_issue as postgresql_support_issue,
+    probe_postgresql_support as probe_postgresql_support,
 )
 
 PG_CONNECTION_TIMEOUT_SECONDS = 30

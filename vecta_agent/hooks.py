@@ -12,10 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from vecta_agent import hook_runtime
-from vecta_agent.hook_runtime import HookResult, _argv, _bounded_reader
+from vecta_agent.hook_runtime import HookResult
 
 from vecta_agent.hook_schema import (
-    HookCatalogError, _validate_schema, capability_metadata, validate_parameters,
+    HookCatalogError,
+    _validate_schema,
+    capability_metadata as capability_metadata,
+    validate_parameters,
 )
 
 try:
