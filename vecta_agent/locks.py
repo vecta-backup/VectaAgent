@@ -72,6 +72,7 @@ class RepositoryLock(JobLock):
 
     def __init__(self, destination: str) -> None:
         digest = hashlib.sha256(destination.strip().encode("utf-8")).hexdigest()
+        self.digest = digest
         self.path = Path(tempfile.gettempdir()) / f"vecta-repo-{digest}.lock"
         self._fd = None
 

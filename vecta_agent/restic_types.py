@@ -28,8 +28,10 @@ class RepoCheck:
         stderr_tail: str = "",
         timed_out: bool = False,
         cancelled: bool = False,
+        format_version: int | str | None = None,
     ) -> None:
         self.exists = exists
         self.stderr_tail = stderr_tail
         self.timed_out = timed_out
         self.cancelled = cancelled
+        self.format_version = format_version

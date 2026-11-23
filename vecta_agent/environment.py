@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,12 @@ from vecta_agent import api, credentials, status
 logger = logging.getLogger("vecta_agent")
 
 MAX_SECRET_MESSAGE_CHARS = 500
+_URI_PASSWORD = re.compile(r"(?i)(://[^:/@\s]+:)[^@/\s]+@")
+_INLINE_SECRET = re.compile(
+    r"(?i)\b([\w-]*?(?:password|passwd|secret|token|access[_-]?key|client[_-]?secret)|api[_-]?key)"
+    r"([\"']?\s*[:=]\s*[\"']?)([^\"'&\s,}]+)"
+)
+_VECTA_API_KEY = re.compile(r"\bvc_[A-Za-z0-9_-]{32,}\b")
 _SECRET_ENV_MARKERS = (
     "PASSWORD", "SECRET", "TOKEN", "ACCESS_KEY", "ACCOUNT_KEY", "CREDENTIAL", "AUTH",
 )
@@ -100,6 +107,9 @@ def redact_secrets(message: str, env: dict[str, str] | None) -> str:
     for key, value in (env or {}).items():
         if value and any(marker in key.upper() for marker in _SECRET_ENV_MARKERS):
             result = result.replace(value, "[REDACTED]")
+    result = _VECTA_API_KEY.sub("[REDACTED]", result)
+    result = _URI_PASSWORD.sub(r"\1[REDACTED]@", result)
+    result = _INLINE_SECRET.sub(r"\1\2[REDACTED]", result)
     return result[:MAX_SECRET_MESSAGE_CHARS]
 
 

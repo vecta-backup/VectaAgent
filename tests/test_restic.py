@@ -539,3 +539,17 @@ class TestComputeProgress:
 
     def test_no_progress(self):
         assert restic.compute_progress({"bytes_done": 50}) is None
+
+
+class TestComputeBackupProgress:
+    def test_database_jobs_omit_the_percentage(self):
+        # pg_dump streams an unknown-length dump, so Restic's percentage would
+        # describe the pipe and not the backup itself.
+        event = {"percent_done": 0.5, "bytes_done": 50, "total_bytes": 100}
+        assert restic.compute_backup_progress(event, "database") is None
+
+    def test_filesystem_jobs_report_the_percentage(self):
+        assert restic.compute_backup_progress({"percent_done": 0.5}, "files") == 50
+
+    def test_unknown_backup_type_reports_the_percentage(self):
+        assert restic.compute_backup_progress({"percent_done": 0.5}, None) == 50

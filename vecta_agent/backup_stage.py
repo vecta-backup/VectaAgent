@@ -12,6 +12,11 @@ from vecta_agent import environment, postgresql, restic
 
 logger = logging.getLogger("vecta_agent")
 
+# Restic emits a --json status event about once a second, far too often to be
+# useful in an operator-facing log. Debug progress lines are at most one per
+# this interval (and only when the reported values actually changed).
+PROGRESS_LOG_INTERVAL_SECONDS = 10.0
+
 
 def run_backup_stage(
     *,
@@ -44,6 +49,7 @@ def run_backup_stage(
     """Run one source through the shared Restic runner and return any failure."""
     stage = "source_capture" if backup_type == "database" else "restic"
     stats: dict[str, Any] = {"stage": stage}
+    logger.info("Source capture started (type: %s)", backup_type)
     client.report_status(
         job_id,
         {"job_id": job_id, "run_id": run_id, "status": "running", "stage": stage, **metadata},
@@ -92,14 +98,31 @@ def run_backup_stage(
     timeout_thread.start()
     stage_started = time.monotonic()
     stream_error = False
+    last_logged_progress: tuple[int | None, int | None] | None = None
+    last_progress_log = float("-inf")
     try:
         for obj in runner.stream():
             if obj.get("message_type") == "status":
-                stats["progress"] = restic.compute_progress(obj)
+                stats["progress"] = restic.compute_backup_progress(obj, backup_type)
                 if isinstance(obj.get("files_done"), int):
                     stats["files_processed"] = obj["files_done"]
                 if isinstance(obj.get("bytes_done"), int):
                     stats["bytes_processed"] = obj["bytes_done"]
+                progress = stats.get("progress")
+                processed = stats.get("bytes_processed")
+                progress_detail = (progress, processed)
+                now = time.monotonic()
+                if (
+                    progress_detail != (None, None)
+                    and progress_detail != last_logged_progress
+                    and now - last_progress_log >= PROGRESS_LOG_INTERVAL_SECONDS
+                ):
+                    last_logged_progress = progress_detail
+                    last_progress_log = now
+                    if progress is None:
+                        logger.debug("Progress: %s bytes processed", processed or 0)
+                    else:
+                        logger.debug("Progress: %s%% (%s bytes processed)", progress, processed or 0)
             elif obj.get("message_type") == "summary":
                 stats.update(restic.parse_summary(obj))
                 stats["_summary_seen"] = True
@@ -167,6 +190,9 @@ def run_backup_stage(
         stage_results.append(stage_result(stage, "failed", 124, duration, message))
         return 124, stage, message
     if exit_code == 0:
+        snapshot_id = snapshot_stats.get("snapshot_id")
+        if snapshot_id:
+            logger.info("Snapshot created successfully. ID: %s", snapshot_id)
         safe_recovery = environment.redact_secrets(recovery_note, run_env) if recovery_note else None
         stage_results.append(stage_result(stage, "success", 0, duration, safe_recovery))
         if backup_type == "database":

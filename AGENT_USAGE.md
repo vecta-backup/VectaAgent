@@ -295,6 +295,12 @@ Key points:
 - **Lock recovery is bounded.** On recognized Restic lock-acquisition errors, the agent
   calls `restic unlock` and retries the backup once. It does not unlock or retry on unrelated
   errors, cancellations, or timeouts. Pruning uses the same safe unlock-and-retry behavior.
+- **Progress reporting is best-effort and filesystem-only.** While a backup is running the
+  agent re-reports `running` every 10s (this doubles as the run's heartbeat) with the stage,
+  files/bytes processed, and — for filesystem jobs only — a 0-99 percentage derived from
+  Restic's progress events. A database job streams an unknown-length `pg_dump` output, so
+  Restic's percentage would describe the pipe rather than the dump: no percentage is reported
+  for it (bytes processed still are), and the dashboard shows no progress bar.
 - **Restores remain manual.** The agent does not restore data automatically.
 
 ### Exclusions and retention

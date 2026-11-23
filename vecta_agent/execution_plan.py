@@ -78,13 +78,18 @@ def build_execution_plan(
         if backup_type == "files"
         else f"PostgreSQL {source_config['host']}:{source_config['port']}/{source_config['database']}"
     )
-    logger.info("Starting job %s: %s -> %s", job.get("job_id"), source_description, destination)
     catalog = hooks.load_catalog()
     pre_selection = hooks.validate_selection(job.get("pre_hook"), catalog, "pre")
     post_selection = hooks.validate_selection(job.get("post_hook"), catalog, "post")
     job_env = resolve_job_env(client, job["job_id"], job, restic_env, run_id, metadata)
     if job_env is None:
         return None
+    logger.info(
+        "Starting job %s: %s -> %s",
+        job.get("job_id"),
+        environment.redact_secrets(source_description, job_env),
+        environment.redact_secrets(destination, job_env),
+    )
     run_env = dict(job_env)
     if backup_type == "database":
         if not postgresql.probe_postgresql_support():

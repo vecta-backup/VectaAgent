@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from typing import Callable
 
@@ -81,7 +82,14 @@ def check_repo(
     if result.timed_out:
         return RepoCheck(None, result.stderr_tail, timed_out=True)
     if result.exit_code == 0:
-        return RepoCheck(True)
+        try:
+            config = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        version = config.get("version") if isinstance(config, dict) else None
+        if not isinstance(version, (int, str)) or isinstance(version, bool):
+            version = None
+        return RepoCheck(True, format_version=version)
     if result.exit_code == 10:
         return RepoCheck(False, result.stderr_tail)
     if result.exit_code == 1 and _looks_missing(result.stderr_tail):

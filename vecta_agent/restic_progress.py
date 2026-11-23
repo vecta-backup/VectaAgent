@@ -29,3 +29,15 @@ def compute_progress(obj: dict[str, Any]) -> int | None:
     if isinstance(total, (int, float)) and isinstance(done, (int, float)) and total > 0:
         return max(0, min(int((done / total) * 100), 99))
     return None
+
+
+def compute_backup_progress(obj: dict[str, Any], backup_type: str | None) -> int | None:
+    """Compute 0–99 backup progress, or None when a percentage would mislead.
+
+    A database backup streams an unknown-length pg_dump output through Restic, so
+    Restic's percentage describes the pipe, not the dump: it is omitted entirely.
+    Only filesystem backups report one.
+    """
+    if backup_type == "database":
+        return None
+    return compute_progress(obj)

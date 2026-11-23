@@ -35,12 +35,16 @@ def prepare_repository(
 ) -> RepositoryOutcome:
     """Verify or initialize the destination and return a bounded outcome."""
     started = time.monotonic()
+    safe_destination = redact_secrets(destination, env)
     try:
         check = restic.check_repo(destination, env=env, port=port, cancel_event=cancel_event)
         if check.cancelled or cancel_event.is_set():
             return RepositoryOutcome("cancelled", 130, "Cancelled by user", int(time.monotonic() - started))
+        if check.exists is True:
+            version = check.format_version if check.format_version is not None else "unknown"
+            logger.info("Repository probe: valid format version %s", version)
         if check.exists is False:
-            logger.info("Repository at %s not found; initializing.", destination)
+            logger.info("Repository at %s not found; initializing.", safe_destination)
             init = restic.init_repo(destination, env=env, port=port, cancel_event=cancel_event)
             if init.cancelled or cancel_event.is_set():
                 return RepositoryOutcome("cancelled", 130, "Cancelled by user", int(time.monotonic() - started))
@@ -57,11 +61,11 @@ def prepare_repository(
                 logger.error(
                     "Job %s failed: could not initialize repository at %s: %s",
                     job_id,
-                    destination,
+                    safe_destination,
                     message,
                 )
                 return RepositoryOutcome("failed", init.exit_code, message, int(time.monotonic() - started))
-            logger.info("Repository at %s initialized.", destination)
+            logger.info("Repository at %s initialized.", safe_destination)
         elif check.exists is None:
             message = (
                 destination_timeout_message("verify")
@@ -76,7 +80,7 @@ def prepare_repository(
             logger.error(
                 "Job %s failed: could not verify repository at %s: %s",
                 job_id,
-                destination,
+                safe_destination,
                 message,
             )
             return RepositoryOutcome("failed", code, message, int(time.monotonic() - started))

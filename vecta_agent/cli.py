@@ -51,8 +51,8 @@ def _setup_logging() -> None:
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
         stream=sys.stderr,
     )
 
@@ -69,6 +69,20 @@ def run_register(args: argparse.Namespace) -> None:
     config.save(cfg)
     print(f"Agent registered: {cfg.name or cfg.agent_id}")
     print(f"Config written to {config.config_path()}")
+
+
+def run_rotate_key(args: argparse.Namespace) -> None:
+    cfg = config.load()
+    client = api.ApiClient(agent_id=cfg.agent_id, api_key=cfg.api_key)
+    result = client.rotate_key(args.token)
+    config.save(
+        config.Config(
+            agent_id=cfg.agent_id,
+            api_key=result["api_key"],
+            name=cfg.name,
+        )
+    )
+    print("API key rotated successfully.")
 
 
 def run_run(_args: argparse.Namespace) -> None:
@@ -109,6 +123,14 @@ def main(argv: list[str] | None = None) -> None:
     register_parser = subparsers.add_parser("register", help="Register this machine with Vecta")
     register_parser.add_argument("--token", required=True, help="Registration token from the dashboard")
     register_parser.set_defaults(func=run_register)
+
+    rotate_parser = subparsers.add_parser(
+        "rotate-key", help="Rotate this agent's API key using a dashboard token"
+    )
+    rotate_parser.add_argument(
+        "--token", required=True, metavar="ROTATION_TOKEN", help="One-time rotation token"
+    )
+    rotate_parser.set_defaults(func=run_rotate_key)
 
     run_parser = subparsers.add_parser("run", help="Run backup jobs (single pass)")
     run_parser.set_defaults(func=run_run)
