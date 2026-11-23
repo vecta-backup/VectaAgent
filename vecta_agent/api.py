@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any
 
@@ -52,18 +53,34 @@ class ApiClient:
             return body["message"]
         return default
 
+    def _redact_sensitive_text(self, message: str, *sensitive_values: str) -> str:
+        for value in (self.api_key, *sensitive_values):
+            if value:
+                message = message.replace(value, "[REDACTED]")
+        return re.sub(r"\bvc_[A-Za-z0-9_-]{32,}\b", "[REDACTED]", message)
+
     def _check_error(self, response: httpx.Response) -> None:
         if response.status_code == 401:
             raise AgentAuthError(
-                self._server_message(response, "Agent is not registered or the credentials are wrong.")
+                self._redact_sensitive_text(
+                    self._server_message(
+                        response,
+                        "Agent is not registered or the credentials are wrong.",
+                    )
+                )
             )
         if response.status_code == 403:
             raise AgentDeactivatedError(
-                self._server_message(response, "Agent is deactivated.")
+                self._redact_sensitive_text(
+                    self._server_message(response, "Agent is deactivated.")
+                )
             )
         if response.status_code >= 400:
             raise ApiError(
-                f"Unexpected error {response.status_code} from {response.url}: {response.text[:200]}"
+                self._redact_sensitive_text(
+                    f"Unexpected error {response.status_code} from {response.url}: "
+                    f"{response.text[:200]}"
+                )
             )
 
     def _request_with_retry(
@@ -73,6 +90,7 @@ class ApiClient:
         json: dict[str, Any] | None = None,
         auth: bool = True,
         max_retries: int = 3,
+        safe_errors: bool = False,
     ) -> httpx.Response:
         headers: dict[str, str] = {"X-Vecta-Agent-Version": __version__}
         if auth:
@@ -84,9 +102,9 @@ class ApiClient:
                 with httpx.Client(timeout=30.0) as client:
                     response = client.request(method, url, headers=headers, json=json)
                 if response.status_code >= 500:
-                    last_err = ApiError(
-                        f"Server error {response.status_code} from {url}: {response.text[:200]}"
-                    )
+                    details = "" if safe_errors else f": {response.text[:200]}"
+                    details = self._redact_sensitive_text(details)
+                    last_err = ApiError(f"Server error {response.status_code} from {url}{details}")
                 else:
                     return response
             except httpx.TimeoutException:
@@ -110,6 +128,7 @@ class ApiClient:
             json={"registration_token": token},
             auth=False,
             max_retries=1,
+            safe_errors=True,
         )
         if response.status_code == 200:
             return response.json()
@@ -122,15 +141,49 @@ class ApiClient:
             )
         if response.status_code == 403:
             raise RegisterError(
-                self._server_message(
-                    response,
-                    "Registration was rejected by the server. "
-                    "The token may have already been used or expired - "
-                    "generate a new token from the dashboard.",
+                self._redact_sensitive_text(
+                    self._server_message(
+                        response,
+                        "Registration was rejected by the server. "
+                        "The token may have already been used or expired - "
+                        "generate a new token from the dashboard.",
+                    ),
+                    token,
                 )
             )
         self._check_error(response)
         return response.json()
+
+    def rotate_key(self, rotation_token: str) -> dict[str, Any]:
+        """Exchange a one-time rotation token for a fresh API key.
+
+        This operation is deliberately not retried: if the server consumed the
+        token but the response was lost, retrying cannot safely recover the
+        one-time raw key.
+        """
+        response = self._request_with_retry(
+            "POST",
+            self._url("/agents/rotate"),
+            json={"agent_id": self.agent_id, "rotation_token": rotation_token},
+            auth=False,
+            max_retries=0,
+            safe_errors=True,
+        )
+        if response.status_code != 200:
+            # Do not surface arbitrary server text here: it could echo the
+            # submitted credential or other sensitive request details.
+            message = self._redact_sensitive_text(
+                self._server_message(response, "API key rotation was rejected."),
+                rotation_token,
+            )
+            raise ApiError(message)
+        result = response.json()
+        api_key = result.get("api_key") if isinstance(result, dict) else None
+        if not isinstance(api_key, str) or not re.fullmatch(r"vc_[0-9a-f]{32}", api_key):
+            raise ApiError("The backend returned an invalid API key during rotation.")
+        if result.get("agent_id") != self.agent_id:
+            raise ApiError("The backend returned a key for a different agent.")
+        return result
 
     def me(self) -> dict[str, Any]:
         """GET /agents/{id}/me — validates credentials and stamps last_seen_at."""

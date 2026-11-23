@@ -185,7 +185,7 @@ def retry_backup_after_lock(
     try:
         for obj in retry_runner.stream():
             if obj.get("message_type") == "status":
-                stats["progress"] = restic.compute_progress(obj)
+                stats["progress"] = restic.compute_backup_progress(obj, metadata.get("backup_type"))
                 if isinstance(obj.get("files_done"), int):
                     stats["files_processed"] = obj["files_done"]
                 if isinstance(obj.get("bytes_done"), int):

@@ -1,6 +1,6 @@
 import threading
 
-from vecta_agent import agent, config, hooks, postgresql, restic
+from vecta_agent import agent, config, environment, hooks, postgresql, restic
 
 
 DB_SOURCE = {
@@ -66,6 +66,28 @@ def _setup_runtime(tmp_config_dir, monkeypatch):
     FakeResticRunner.instances.clear()
 
 
+def test_diagnostic_redaction_masks_known_secrets_and_embedded_credentials():
+    api_key = "vc_" + "a" * 32
+    message = (
+        "https://backup:uri-password@example.test/repo "
+        "rotation_token=rotation-secret "
+        f"RESTIC_PASSWORD=repo-secret {api_key}"
+    )
+
+    redacted = environment.redact_secrets(
+        message,
+        {
+            "RESTIC_PASSWORD": "repo-secret",
+        },
+    )
+
+    assert "uri-password" not in redacted
+    assert "rotation-secret" not in redacted
+    assert "repo-secret" not in redacted
+    assert api_key not in redacted
+    assert redacted.count("[REDACTED]") == 4
+
+
 def test_database_job_uses_stdin_filename_and_reports_restore_metadata(tmp_config_dir, monkeypatch, caplog):
     _setup_runtime(tmp_config_dir, monkeypatch)
     monkeypatch.setattr(postgresql, "probe_postgresql_support", lambda: True)
@@ -96,7 +118,69 @@ def test_database_job_uses_stdin_filename_and_reports_restore_metadata(tmp_confi
     assert {result["status"] for result in terminal["stage_results"]} <= agent.STAGE_RESULT_STATUSES
     assert "repo-secret" not in repr(client.status_reports)
     assert "Starting job db1: PostgreSQL db.internal:5432/orders -> /repo" in caplog.text
+    assert "Acquired repository lock (hash:" in caplog.text
+    assert "Repository probe: valid format version unknown" in caplog.text
+    assert "Source capture started (type: database)" in caplog.text
+    assert "Snapshot created successfully. ID: snap-db" in caplog.text
+    assert "Job completed successfully in" in caplog.text
+    assert "Released repository lock" in caplog.text
     assert "Job db1 succeeded (snapshot snap-db)." in caplog.text
+
+
+def test_database_job_reports_bytes_without_a_progress_percentage(tmp_config_dir, monkeypatch, caplog):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(postgresql, "probe_postgresql_support", lambda: True)
+    monkeypatch.setattr(postgresql, "child_environment", lambda _source: {"PGPASSFILE": "/secure/pgpass"})
+    monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+
+    class StreamingRunner(FakeResticRunner):
+        def stream(self):
+            yield {"message_type": "status", "percent_done": 0.4, "files_done": 1, "bytes_done": 2048}
+            threading.Event().wait(0.2)
+            yield from super().stream()
+
+    monkeypatch.setattr(agent.restic, "ResticRunner", StreamingRunner)
+    client = FakeClient()
+    job = {
+        "job_id": "db-progress", "backup_type": "database", "source": None,
+        "source_config": DB_SOURCE, "destination": "/repo",
+    }
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    running = [report for report in client.status_reports if report["status"] == "running"]
+    assert any(report.get("bytes_processed") == 2048 for report in running)
+    assert all("progress" not in report for report in client.status_reports)
+    assert "Progress: 2048 bytes processed" in caplog.text
+    assert "Progress: 40%" not in caplog.text
+
+
+def test_filesystem_job_reports_progress_and_throttles_debug_logging(tmp_config_dir, monkeypatch, caplog):
+    _setup_runtime(tmp_config_dir, monkeypatch)
+    monkeypatch.setattr(agent, "PROGRESS_INTERVAL_SECONDS", 0.05)
+
+    class StreamingRunner(FakeResticRunner):
+        def stream(self):
+            for step in range(6):
+                yield {
+                    "message_type": "status",
+                    "percent_done": (step + 1) / 10,
+                    "files_done": step + 1,
+                    "bytes_done": (step + 1) * 1000,
+                }
+            threading.Event().wait(0.2)
+            yield from super().stream()
+
+    monkeypatch.setattr(agent.restic, "ResticRunner", StreamingRunner)
+    client = FakeClient()
+    job = {"job_id": "file-progress", "backup_type": "files", "source": "/src", "destination": "/repo"}
+
+    agent._run_single_job(client, config.Config("a", "k"), job, agent.load_restic_env(tmp_config_dir))
+
+    assert any(report.get("progress") == 60 for report in client.status_reports)
+    assert "Progress: 10% (1000 bytes processed)" in caplog.text
+    # Six status events arrive back to back; only the first is logged.
+    assert caplog.text.count("Progress:") == 1
 
 
 def test_file_excludes_and_prune_warning_keep_snapshot_metadata(tmp_config_dir, monkeypatch):

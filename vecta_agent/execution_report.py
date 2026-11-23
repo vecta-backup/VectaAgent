@@ -57,6 +57,7 @@ def finalize_run(
     post_selection,
     prune_message: str | None,
     job_id: str,
+    start_time: float,
     stage_results: list[dict[str, Any]],
     snapshot_stats: dict[str, Any],
     report_terminal: Callable[..., None],
@@ -96,6 +97,8 @@ def finalize_run(
     elif zero_files:
         logger.warning("Job %s completed with no files processed.", job_id)
     else:
+        duration = int(time.monotonic() - start_time)
+        logger.info("Job completed successfully in %ss", duration)
         logger.info("Job %s succeeded (snapshot %s).", job_id, snapshot_stats.get("snapshot_id"))
 
 

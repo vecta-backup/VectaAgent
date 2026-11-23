@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from typing import Any
 
 from vecta_agent import environment, restic, status
+
+logger = logging.getLogger("vecta_agent")
 
 
 def validate_job_storage_config(
@@ -56,6 +59,7 @@ def run_prune(
             ]
         except (json.JSONDecodeError, TypeError, AttributeError):
             pruned_ids = []
+        logger.debug("Pruned %s expired snapshot(s)", len(pruned_ids))
         return status.stage_result("prune", "success", 0, duration, safe), None, pruned_ids
     if result.cancelled:
         reason = "Pruning was cancelled after the snapshot was committed."

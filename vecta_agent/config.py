@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -87,5 +88,16 @@ def save(config: Config) -> None:
         lines.append(f'name = "{_escape_toml_value(config.name)}"')
     lines.append("")  # trailing newline
 
-    path.write_text("\n".join(lines), encoding="utf-8")
-    os.chmod(path, 0o600)
+    fd, temporary_name = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as config_file:
+            config_file.write("\n".join(lines))
+            config_file.flush()
+            os.fsync(config_file.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()

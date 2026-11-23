@@ -26,6 +26,38 @@ class TestApiClient:
         assert calls[0][2]["X-Vecta-Agent-Version"] == __version__
         assert calls[0][3] == {"registration_token": "tok"}
 
+    def test_rotate_key_uses_agent_binding_and_does_not_send_existing_key(self, monkeypatch):
+        calls = []
+        new_key = "vc_" + "a" * 32
+
+        def fake_request(method, url, headers=None, json=None):
+            calls.append((method, url, headers, json))
+            return _resp(method, url, 200, {"agent_id": "a1", "api_key": new_key})
+
+        monkeypatch.setattr(api.httpx, "Client", lambda **kw: _FakeClient(fake_request))
+        client = api.ApiClient("a1", "vc_old", base_url="http://test/api")
+
+        result = client.rotate_key("rotation-secret")
+
+        assert result["api_key"] == new_key
+        assert calls[0][0:2] == ("POST", "http://test/api/agents/rotate")
+        assert "Authorization" not in calls[0][2]
+        assert calls[0][3] == {"agent_id": "a1", "rotation_token": "rotation-secret"}
+
+    def test_rotate_key_rejects_response_for_a_different_agent(self, monkeypatch):
+        def fake_request(method, url, headers=None, json=None):
+            return _resp(
+                method,
+                url,
+                200,
+                {"agent_id": "a2", "api_key": "vc_" + "a" * 32},
+            )
+
+        monkeypatch.setattr(api.httpx, "Client", lambda **kw: _FakeClient(fake_request))
+        client = api.ApiClient("a1", "vc_old", base_url="http://test/api")
+        with pytest.raises(api.ApiError, match="different agent"):
+            client.rotate_key("rotation-secret")
+
     def test_sends_version_header_on_authed_requests(self, monkeypatch):
         calls = []
 

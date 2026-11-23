@@ -50,6 +50,10 @@ def run_pipeline_job(
     lock = RunLocks(job_id, destination if isinstance(destination, str) else "")
     if not lock.acquire():
         return
+    logger.debug(
+        "Acquired repository lock (hash: %s)",
+        lock.repository_lock.digest,
+    )
     start_time = time.monotonic()
     cancel_event = threading.Event()
     done_event = threading.Event()
@@ -102,6 +106,8 @@ def run_pipeline_job(
         post_selection = plan.post_selection
         job_env = plan.job_env
         run_env = plan.run_env
+        safe_excludes = environment.redact_secrets(repr(excludes), run_env)
+        logger.debug("Active exclude patterns (%s): %s", len(excludes), safe_excludes)
 
         # Repository preparation is intentionally outside the user pipeline.
         terminator.set_probe(cancel_event)
@@ -223,6 +229,16 @@ def run_pipeline_job(
             for result in stage_results
         )
         if backup_committed and retention_policy is not None:
+            within_days = retention_policy.get("keep_within_days")
+            if within_days is not None:
+                retention_description = f"--keep-within {within_days}d"
+            else:
+                retention_description = ", ".join(
+                    f"--keep-{period} {retention_policy[f'keep_{period}']}"
+                    for period in ("daily", "weekly", "monthly")
+                    if retention_policy.get(f"keep_{period}")
+                )
+            logger.info("Retention policy active: evaluating %s", retention_description)
             prune_stage, prune_message, pruned_ids = run_prune(
                 destination, port, job_env, retention_policy, cancel_event, job_id=job_id
             )
@@ -236,6 +252,7 @@ def run_pipeline_job(
             post_selection=post_selection,
             prune_message=prune_message,
             job_id=job_id,
+            start_time=start_time,
             stage_results=stage_results,
             snapshot_stats=snapshot_stats,
             report_terminal=report_terminal,
@@ -259,3 +276,4 @@ def run_pipeline_job(
         if cancel_thread is not None:
             cancel_thread.join(timeout=cancel_interval_seconds + 2)
         lock.release()
+        logger.debug("Released repository lock")

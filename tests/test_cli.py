@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 
 import pytest
@@ -21,6 +22,44 @@ class FakeSetupClient:
 
 
 class TestCli:
+    def test_rotate_key_updates_config_with_restricted_permissions(
+        self, tmp_config_dir, monkeypatch, capsys
+    ):
+        make_config(tmp_config_dir)
+        calls = []
+        chmod_modes = []
+        real_chmod = os.chmod
+
+        def recording_chmod(path, mode):
+            chmod_modes.append(mode)
+            real_chmod(path, mode)
+
+        monkeypatch.setattr(cli.config.os, "chmod", recording_chmod)
+
+        def fake_rotate(self, token):
+            calls.append((self.agent_id, token))
+            return {"agent_id": "a1", "api_key": "vc_" + "b" * 32}
+
+        monkeypatch.setattr(cli.api.ApiClient, "rotate_key", fake_rotate)
+
+        cli.main(["rotate-key", "--token", "rotation-token"])
+
+        assert calls == [("a1", "rotation-token")]
+        assert config.load().api_key == "vc_" + "b" * 32
+        assert 0o600 in chmod_modes
+        if os.name == "posix":
+            assert (tmp_config_dir / "config.toml").stat().st_mode & 0o777 == 0o600
+        assert "API key rotated successfully." in capsys.readouterr().out
+
+    def test_rotate_key_help(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["rotate-key", "--help"])
+
+        assert exc.value.code == 0
+        output = capsys.readouterr().out
+        assert "rotate-key" in output
+        assert "--token ROTATION_TOKEN" in output
+
     def test_hooks_add_writes_validated_entry_to_single_catalog(
         self, tmp_path, monkeypatch, capsys, mock_hook_account
     ):

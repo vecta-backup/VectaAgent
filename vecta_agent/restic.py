@@ -11,6 +11,7 @@ import threading
 
 from vecta_agent import restic_command, restic_progress as restic_progress, restic_repository
 from vecta_agent.restic_progress import (
+    compute_backup_progress as compute_backup_progress,
     compute_progress as compute_progress,
     parse_summary as parse_summary,
 )
